@@ -94,6 +94,7 @@ class OverlayService : Service() {
     private var pauseButtonRef: Button? = null
 
     private var mediaProjection: MediaProjection? = null
+    private var mediaProjectionTypeActive = false
     private var captureController: ScreenCaptureController? = null
     private var captureMode = CaptureMode.ON_DEMAND
     private var isAutoPaused = false
@@ -110,6 +111,8 @@ class OverlayService : Service() {
             captureController?.release()
             captureController = null
             mediaProjection = null
+            mediaProjectionTypeActive = false
+            ensureForeground()
             lastAutoFrame?.recycle()
             lastAutoFrame = null
             if (captureMode == CaptureMode.AUTO) {
@@ -183,6 +186,12 @@ class OverlayService : Service() {
     // region Media projection
 
     private fun onProjectionGranted(resultCode: Int, data: Intent) {
+        // Android 14+ requires the FGS to already be running with the mediaProjection type
+        // before getMediaProjection() is called, and rejects requesting that type before
+        // consent exists — so promote only now, never at initial service startup.
+        mediaProjectionTypeActive = true
+        ensureForeground()
+
         val projection = mediaProjectionManager.getMediaProjection(resultCode, data)
         projection.registerCallback(projectionCallback, mainHandler)
         mediaProjection = projection
@@ -620,12 +629,18 @@ class OverlayService : Service() {
     private fun ensureForeground() {
         val notification = buildForegroundNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            val type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            startForeground(FOREGROUND_NOTIFICATION_ID, notification, type)
+            startForeground(FOREGROUND_NOTIFICATION_ID, notification, currentForegroundServiceType())
         } else {
             startForeground(FOREGROUND_NOTIFICATION_ID, notification)
         }
+    }
+
+    private fun currentForegroundServiceType(): Int {
+        var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        if (mediaProjectionTypeActive) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        }
+        return type
     }
 
     private fun buildForegroundNotification(): Notification {
