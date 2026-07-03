@@ -1,5 +1,7 @@
 package com.raidcoach.app
 
+import android.graphics.Bitmap
+
 enum class CaptureMode { AUTO, ON_DEMAND }
 
 data class ApiContentBlock(
@@ -12,4 +14,14 @@ data class ApiContentBlock(
 data class ApiMessage(
     val role: String,
     val blocks: List<ApiContentBlock>
+)
+
+data class DisplayEntry(
+    val label: String,
+    val text: String,
+    val thumbnail: Bitmap? = null,
+    val timestamp: Long = System.currentTimeMillis(),
+    val isTyping: Boolean = false,
+    val isWatching: Boolean = false,
+    val isError: Boolean = false
 )

@@ -4,8 +4,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+
+sealed class AnthropicError(message: String) : Exception(message) {
+    class InvalidApiKey : AnthropicError("Invalid API key — check it in Settings.")
+    class RateLimited : AnthropicError("Rate limited by Anthropic. Try again in a moment.")
+    class ApiError(code: Int, detail: String) : AnthropicError("Anthropic API error ($code): $detail")
+    class NetworkError(cause: Throwable) :
+        AnthropicError(cause.message?.let { "Network error: $it" } ?: "Network error — check your connection.")
+}
 
 object AnthropicClient {
 
@@ -20,29 +29,48 @@ object AnthropicClient {
         history: List<ApiMessage>
     ): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            val connection = URL(ENDPOINT).openConnection() as HttpURLConnection
             try {
-                connection.requestMethod = "POST"
-                connection.doOutput = true
-                connection.connectTimeout = 30_000
-                connection.readTimeout = 60_000
-                connection.setRequestProperty("x-api-key", apiKey)
-                connection.setRequestProperty("anthropic-version", ANTHROPIC_VERSION)
-                connection.setRequestProperty("content-type", "application/json")
+                val connection = URL(ENDPOINT).openConnection() as HttpURLConnection
+                try {
+                    connection.requestMethod = "POST"
+                    connection.doOutput = true
+                    connection.connectTimeout = 30_000
+                    connection.readTimeout = 60_000
+                    connection.setRequestProperty("x-api-key", apiKey)
+                    connection.setRequestProperty("anthropic-version", ANTHROPIC_VERSION)
+                    connection.setRequestProperty("content-type", "application/json")
 
-                val body = buildRequestBody(systemPrompt, history)
-                connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                    val body = buildRequestBody(systemPrompt, history)
+                    connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
 
-                val responseCode = connection.responseCode
-                val stream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
-                val responseText = stream.bufferedReader().use { it.readText() }
+                    val responseCode = connection.responseCode
+                    val stream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
+                    val responseText = stream.bufferedReader().use { it.readText() }
 
-                check(responseCode in 200..299) { "Anthropic API error $responseCode: $responseText" }
+                    if (responseCode !in 200..299) {
+                        throw errorFor(responseCode, responseText)
+                    }
 
-                parseReply(responseText)
-            } finally {
-                connection.disconnect()
+                    parseReply(responseText)
+                } finally {
+                    connection.disconnect()
+                }
+            } catch (e: IOException) {
+                throw AnthropicError.NetworkError(e)
             }
+        }
+    }
+
+    private fun errorFor(code: Int, body: String): AnthropicError {
+        val detail = runCatching { JSONObject(body).optJSONObject("error")?.optString("message") }
+            .getOrNull()
+            .takeUnless { it.isNullOrBlank() }
+            ?: body.take(200)
+
+        return when (code) {
+            401 -> AnthropicError.InvalidApiKey()
+            429 -> AnthropicError.RateLimited()
+            else -> AnthropicError.ApiError(code, detail)
         }
     }
 
