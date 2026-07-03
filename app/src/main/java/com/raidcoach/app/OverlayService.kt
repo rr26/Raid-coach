@@ -78,11 +78,13 @@ class OverlayService : Service() {
         private const val HIDE_BEFORE_CAPTURE_DELAY_MS = 120L
         private const val AUTO_CAPTURE_INTERVAL_MS = 60_000L
         private const val MAX_HISTORY_MESSAGES = 30 // 15 exchanges
+        private const val RECENT_IMAGE_MESSAGE_COUNT = 3
+        private const val WATCHING_REPLY = "watching"
 
-        private const val SYSTEM_PROMPT_PREFIX = "You are a Raid: Shadow Legends coach. Analyze each screenshot " +
-            "of my gameplay. Give short, actionable advice: what to do this turn, misplays you spot, better " +
-            "skill order, team or gear improvements. Be concise — 2-3 sentences unless asked. If the screen " +
-            "shows nothing actionable, reply \"watching\"."
+        private const val SYSTEM_PROMPT_PREFIX = "You are a Raid: Shadow Legends coach watching my gameplay via " +
+            "screenshots. Give short, actionable advice: what to do this turn, misplays you spot, better skill " +
+            "order, team/gear/build improvements, alternative strategies. Be concise — 2-3 sentences unless I " +
+            "ask for more. If a screenshot shows nothing actionable, reply exactly 'watching'."
     }
 
     private val overlayWindowType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -122,6 +124,7 @@ class OverlayService : Service() {
     private lateinit var messageAdapter: ChatAdapter
     private val history = mutableListOf<ApiMessage>()
     private val timeFormatter = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+    private var typingEntry: DisplayEntry? = null
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -230,7 +233,7 @@ class OverlayService : Service() {
         if (captureMode == CaptureMode.AUTO) {
             captureMode = CaptureMode.ON_DEMAND
         }
-        appendDisplayMessage("Coach", "Screen capture permission was not granted.")
+        appendDisplayMessage("Coach", "Screen capture permission was not granted.", isError = true)
         refreshControlsUi()
         updateBubbleIndicator()
     }
@@ -272,7 +275,7 @@ class OverlayService : Service() {
         serviceScope.launch {
             val bitmap = captureWithOverlayHidden()
             if (bitmap == null) {
-                appendDisplayMessage("Coach", "Couldn't capture the screen. Try again.")
+                appendDisplayMessage("Coach", "Couldn't capture the screen. Try again.", isError = true)
                 return@launch
             }
             sendCapturedFrame(bitmap, "[Screenshot]")
@@ -601,6 +604,11 @@ class OverlayService : Service() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
 
+        val clearButton = Button(this).apply {
+            text = "Clear"
+            setOnClickListener { onClearConversationClicked() }
+        }
+
         val settingsButton = Button(this).apply {
             text = "Settings"
             setOnClickListener {
@@ -618,6 +626,7 @@ class OverlayService : Service() {
         }
 
         header.addView(title)
+        header.addView(clearButton)
         header.addView(settingsButton)
         header.addView(collapseButton)
 
@@ -813,7 +822,7 @@ class OverlayService : Service() {
             try {
                 val bitmap = captureWithOverlayHidden()
                 if (bitmap == null) {
-                    appendDisplayMessage("Coach", "Couldn't capture the screen. Try again.")
+                    appendDisplayMessage("Coach", "Couldn't capture the screen. Try again.", isError = true)
                     return@launch
                 }
                 val downscaled = downscaleForUpload(bitmap)
@@ -852,19 +861,24 @@ class OverlayService : Service() {
     private suspend fun requestCoachReply() {
         val apiKey = securePrefs.getApiKey()
         if (apiKey.isNullOrBlank()) {
-            appendDisplayMessage("Coach", "No API key set. Open Settings to add one.")
+            appendDisplayMessage("Coach", "No API key set. Open Settings to add one.", isError = true)
             return
         }
+
+        showTypingIndicator()
 
         val systemPrompt = buildSystemPrompt(securePrefs.getBriefing().orEmpty())
         val result = AnthropicClient.sendMessage(apiKey, systemPrompt, history)
 
+        hideTypingIndicator()
+
         result.onSuccess { reply ->
             appendHistory(ApiMessage(role = "assistant", blocks = listOf(ApiContentBlock(type = "text", text = reply))))
-            appendDisplayMessage("Coach", reply)
-            if (!isExpanded) showReplyNotification(reply)
+            val isWatching = reply.trim() == WATCHING_REPLY
+            appendDisplayMessage("Coach", reply, isWatching = isWatching)
+            if (!isExpanded && !isWatching) showReplyNotification(reply)
         }.onFailure { error ->
-            appendDisplayMessage("Coach", "Error: ${error.message ?: "request failed"}")
+            appendDisplayMessage("Coach", error.message ?: "Something went wrong.", isError = true)
         }
     }
 
@@ -876,12 +890,60 @@ class OverlayService : Service() {
         while (history.size > MAX_HISTORY_MESSAGES) {
             history.removeAt(0)
         }
+        stripOldImageBlocks()
     }
 
-    private fun appendDisplayMessage(label: String, text: String, thumbnail: Bitmap? = null) {
-        displayMessages.add(DisplayEntry(label, text, thumbnail))
+    // Keeps image data only on the most recent messages so payload size/memory don't grow unbounded.
+    private fun stripOldImageBlocks() {
+        val keepImagesFrom = (history.size - RECENT_IMAGE_MESSAGE_COUNT).coerceAtLeast(0)
+        for (i in 0 until keepImagesFrom) {
+            val message = history[i]
+            if (message.blocks.none { it.type == "image" }) continue
+
+            history[i] = message.copy(
+                blocks = message.blocks.map { block ->
+                    if (block.type == "image") {
+                        ApiContentBlock(type = "text", text = "[earlier screenshot]")
+                    } else {
+                        block
+                    }
+                }
+            )
+        }
+    }
+
+    private fun showTypingIndicator() {
+        val entry = DisplayEntry(label = "Coach", text = "typing…", isTyping = true)
+        typingEntry = entry
+        displayMessages.add(entry)
         messageAdapter.notifyDataSetChanged()
         listViewRef?.setSelection(messageAdapter.count - 1)
+    }
+
+    private fun hideTypingIndicator() {
+        typingEntry?.let { displayMessages.remove(it) }
+        typingEntry = null
+        messageAdapter.notifyDataSetChanged()
+    }
+
+    private fun appendDisplayMessage(
+        label: String,
+        text: String,
+        thumbnail: Bitmap? = null,
+        isWatching: Boolean = false,
+        isError: Boolean = false
+    ) {
+        displayMessages.add(DisplayEntry(label, text, thumbnail, isWatching = isWatching, isError = isError))
+        messageAdapter.notifyDataSetChanged()
+        listViewRef?.setSelection(messageAdapter.count - 1)
+    }
+
+    private fun onClearConversationClicked() {
+        displayMessages.forEach { it.thumbnail?.recycle() }
+        displayMessages.clear()
+        history.clear()
+        typingEntry = null
+        messageAdapter.notifyDataSetChanged()
     }
 
     // endregion
@@ -996,16 +1058,30 @@ class OverlayService : Service() {
                 orientation = LinearLayout.VERTICAL
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
-            textColumn.addView(
-                TextView(context).apply { text = "${entry.label}: ${entry.text}" }
-            )
+
             textColumn.addView(
                 TextView(context).apply {
-                    text = timeFormatter.format(Date(entry.timestamp))
-                    textSize = 10f
-                    setTextColor(Color.GRAY)
+                    text = if (entry.isTyping) "${entry.label} is typing…" else "${entry.label}: ${entry.text}"
+                    when {
+                        entry.isError -> setTextColor(Color.rgb(198, 40, 40))
+                        entry.isTyping -> setTextColor(Color.GRAY)
+                        entry.isWatching -> {
+                            setTextColor(Color.GRAY)
+                            textSize = 12f
+                        }
+                    }
                 }
             )
+
+            if (!entry.isTyping) {
+                textColumn.addView(
+                    TextView(context).apply {
+                        text = timeFormatter.format(Date(entry.timestamp))
+                        textSize = 10f
+                        setTextColor(Color.GRAY)
+                    }
+                )
+            }
 
             row.addView(textColumn)
             return row

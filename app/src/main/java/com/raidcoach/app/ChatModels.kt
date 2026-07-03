@@ -20,5 +20,8 @@ data class DisplayEntry(
     val label: String,
     val text: String,
     val thumbnail: Bitmap? = null,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val isTyping: Boolean = false,
+    val isWatching: Boolean = false,
+    val isError: Boolean = false
 )
