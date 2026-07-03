@@ -1,0 +1,40 @@
+package com.raidcoach.app
+
+import android.content.Context
+import android.content.SharedPreferences
+
+class PanelLayoutPrefs private constructor(context: Context) {
+
+    private val prefs: SharedPreferences =
+        context.applicationContext.getSharedPreferences(PREFS_FILE_NAME, Context.MODE_PRIVATE)
+
+    fun getX(default: Int): Int = prefs.getInt(KEY_X, default)
+    fun getY(default: Int): Int = prefs.getInt(KEY_Y, default)
+    fun getWidth(default: Int): Int = prefs.getInt(KEY_WIDTH, default)
+    fun getHeight(default: Int): Int = prefs.getInt(KEY_HEIGHT, default)
+
+    fun save(x: Int, y: Int, width: Int, height: Int) {
+        prefs.edit()
+            .putInt(KEY_X, x)
+            .putInt(KEY_Y, y)
+            .putInt(KEY_WIDTH, width)
+            .putInt(KEY_HEIGHT, height)
+            .apply()
+    }
+
+    companion object {
+        private const val PREFS_FILE_NAME = "panel_layout_prefs"
+        private const val KEY_X = "panel_x"
+        private const val KEY_Y = "panel_y"
+        private const val KEY_WIDTH = "panel_width"
+        private const val KEY_HEIGHT = "panel_height"
+
+        @Volatile
+        private var instance: PanelLayoutPrefs? = null
+
+        fun getInstance(context: Context): PanelLayoutPrefs =
+            instance ?: synchronized(this) {
+                instance ?: PanelLayoutPrefs(context).also { instance = it }
+            }
+    }
+}

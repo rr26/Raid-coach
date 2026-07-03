@@ -24,11 +24,13 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewGroup
 import android.view.WindowManager
-import android.widget.ArrayAdapter
+import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
@@ -44,6 +46,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.abs
 
 class OverlayService : Service() {
@@ -65,6 +70,12 @@ class OverlayService : Service() {
         private const val COACH_BUTTON_SIZE_DP = 26
         private const val RED_DOT_SIZE_DP = 12
         private const val PANEL_WIDTH_FRACTION = 0.4f
+        private const val MIN_PANEL_WIDTH_DP = 250
+        private const val MIN_PANEL_HEIGHT_DP = 300
+        private const val MAX_PANEL_SIZE_FRACTION = 0.9f
+        private const val RESIZE_HANDLE_SIZE_DP = 28
+        private const val THUMBNAIL_SIZE_DP = 40
+        private const val HIDE_BEFORE_CAPTURE_DELAY_MS = 120L
         private const val AUTO_CAPTURE_INTERVAL_MS = 60_000L
         private const val MAX_HISTORY_MESSAGES = 30 // 15 exchanges
 
@@ -80,6 +91,7 @@ class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
     private lateinit var securePrefs: SecurePrefs
+    private lateinit var panelLayoutPrefs: PanelLayoutPrefs
     private lateinit var mediaProjectionManager: MediaProjectionManager
 
     private lateinit var bubbleView: View
@@ -92,6 +104,8 @@ class OverlayService : Service() {
     private var listViewRef: ListView? = null
     private var modeButtonRef: Button? = null
     private var pauseButtonRef: Button? = null
+    private var pendingThumbnailContainer: View? = null
+    private var pendingThumbnailImageView: ImageView? = null
 
     private var mediaProjection: MediaProjection? = null
     private var mediaProjectionTypeActive = false
@@ -101,10 +115,13 @@ class OverlayService : Service() {
     private var autoLoopJob: Job? = null
     private var lastAutoFrame: Bitmap? = null
     private var pendingAction: (() -> Unit)? = null
+    private var pendingCaptureBitmap: Bitmap? = null
+    private var isCapturingPendingAttachment = false
 
-    private val displayMessages = mutableListOf<String>()
-    private lateinit var messageAdapter: ArrayAdapter<String>
+    private val displayMessages = mutableListOf<DisplayEntry>()
+    private lateinit var messageAdapter: ChatAdapter
     private val history = mutableListOf<ApiMessage>()
+    private val timeFormatter = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -128,7 +145,8 @@ class OverlayService : Service() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         securePrefs = SecurePrefs.getInstance(this)
-        messageAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, displayMessages)
+        panelLayoutPrefs = PanelLayoutPrefs.getInstance(this)
+        messageAdapter = ChatAdapter()
 
         bubbleView = createBubbleView()
         bubbleParams = createBubbleParams(dp(BUBBLE_SIZE_DP))
@@ -178,6 +196,8 @@ class OverlayService : Service() {
         mediaProjection?.stop()
         captureController?.release()
         lastAutoFrame?.recycle()
+        pendingCaptureBitmap?.recycle()
+        displayMessages.forEach { it.thumbnail?.recycle() }
 
         runCatching { windowManager.removeView(bubbleView) }
         panelView?.let { view -> runCatching { windowManager.removeView(view) } }
@@ -235,8 +255,7 @@ class OverlayService : Service() {
     }
 
     private suspend fun performAutoCapture() {
-        val controller = captureController ?: return
-        val bitmap = controller.captureBitmap() ?: return
+        val bitmap = captureWithOverlayHidden() ?: return
 
         val previous = lastAutoFrame
         if (previous != null && isNearlyIdentical(previous, bitmap)) {
@@ -246,24 +265,46 @@ class OverlayService : Service() {
 
         previous?.recycle()
         lastAutoFrame = bitmap
-        sendCapturedFrame(bitmap)
+        sendCapturedFrame(bitmap, "Auto-screenshot sent")
     }
 
     private fun performImmediateCapture() {
-        val controller = captureController ?: return
         serviceScope.launch {
-            val bitmap = controller.captureBitmap()
+            val bitmap = captureWithOverlayHidden()
             if (bitmap == null) {
                 appendDisplayMessage("Coach", "Couldn't capture the screen. Try again.")
                 return@launch
             }
-            sendCapturedFrame(bitmap)
+            sendCapturedFrame(bitmap, "[Screenshot]")
             bitmap.recycle()
         }
     }
 
-    private suspend fun sendCapturedFrame(bitmap: Bitmap) {
-        appendDisplayMessage("You", "[Screenshot]")
+    // Hides the bubble/panel for one frame so the coach sees the game, not our own overlay.
+    private suspend fun captureWithOverlayHidden(): Bitmap? {
+        val controller = captureController ?: return null
+        hideOverlayViews()
+        return try {
+            delay(HIDE_BEFORE_CAPTURE_DELAY_MS)
+            controller.captureBitmap()
+        } finally {
+            showOverlayViews()
+        }
+    }
+
+    private fun hideOverlayViews() {
+        bubbleView.visibility = View.INVISIBLE
+        panelView?.visibility = View.INVISIBLE
+    }
+
+    private fun showOverlayViews() {
+        bubbleView.visibility = View.VISIBLE
+        panelView?.visibility = View.VISIBLE
+    }
+
+    private suspend fun sendCapturedFrame(bitmap: Bitmap, label: String) {
+        val thumbnail = Bitmap.createScaledBitmap(bitmap, dp(THUMBNAIL_SIZE_DP), dp(THUMBNAIL_SIZE_DP), true)
+        appendDisplayMessage("You", label, thumbnail)
 
         val scaled = downscaleForUpload(bitmap)
         val base64 = withContext(Dispatchers.Default) { bitmapToJpegBase64(scaled) }
@@ -419,24 +460,127 @@ class OverlayService : Service() {
 
     private fun createPanelParams(): WindowManager.LayoutParams {
         val screenWidth = resources.displayMetrics.widthPixels
-        val panelWidth = (screenWidth * PANEL_WIDTH_FRACTION).toInt()
+        val screenHeight = resources.displayMetrics.heightPixels
+
+        val defaultWidth = (screenWidth * PANEL_WIDTH_FRACTION).toInt()
+            .coerceIn(minPanelWidthPx(), maxPanelWidthPx())
+        val defaultHeight = maxPanelHeightPx()
+
+        val width = panelLayoutPrefs.getWidth(defaultWidth).coerceIn(minPanelWidthPx(), maxPanelWidthPx())
+        val height = panelLayoutPrefs.getHeight(defaultHeight).coerceIn(minPanelHeightPx(), maxPanelHeightPx())
+
+        val defaultX = screenWidth - width
+        val defaultY = 0
+        val x = panelLayoutPrefs.getX(defaultX).coerceIn(0, (screenWidth - width).coerceAtLeast(0))
+        val y = panelLayoutPrefs.getY(defaultY).coerceIn(0, (screenHeight - height).coerceAtLeast(0))
 
         return WindowManager.LayoutParams(
-            panelWidth,
-            WindowManager.LayoutParams.MATCH_PARENT,
+            width,
+            height,
             overlayWindowType,
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = screenWidth - panelWidth
-            y = 0
+            this.x = x
+            this.y = y
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         }
     }
 
+    private fun minPanelWidthPx() = dp(MIN_PANEL_WIDTH_DP)
+    private fun minPanelHeightPx() = dp(MIN_PANEL_HEIGHT_DP)
+    private fun maxPanelWidthPx() = (resources.displayMetrics.widthPixels * MAX_PANEL_SIZE_FRACTION).toInt()
+    private fun maxPanelHeightPx() = (resources.displayMetrics.heightPixels * MAX_PANEL_SIZE_FRACTION).toInt()
+
+    private fun persistPanelLayout() {
+        val params = panelParams ?: return
+        panelLayoutPrefs.save(params.x, params.y, params.width, params.height)
+    }
+
+    private fun attachPanelDragListener(handle: View) {
+        var initialX = 0
+        var initialY = 0
+        var initialTouchX = 0f
+        var initialTouchY = 0f
+
+        handle.setOnTouchListener { _, event ->
+            val params = panelParams ?: return@setOnTouchListener false
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialX = params.x
+                    initialY = params.y
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val screenWidth = resources.displayMetrics.widthPixels
+                    val screenHeight = resources.displayMetrics.heightPixels
+                    val dx = (event.rawX - initialTouchX).toInt()
+                    val dy = (event.rawY - initialTouchY).toInt()
+
+                    params.x = (initialX + dx).coerceIn(0, (screenWidth - params.width).coerceAtLeast(0))
+                    params.y = (initialY + dy).coerceIn(0, (screenHeight - params.height).coerceAtLeast(0))
+                    panelView?.let { windowManager.updateViewLayout(it, params) }
+                    true
+                }
+
+                MotionEvent.ACTION_UP -> {
+                    persistPanelLayout()
+                    true
+                }
+
+                else -> false
+            }
+        }
+    }
+
+    private fun attachPanelResizeListener(handle: View) {
+        var initialWidth = 0
+        var initialHeight = 0
+        var initialTouchX = 0f
+        var initialTouchY = 0f
+
+        handle.setOnTouchListener { _, event ->
+            val params = panelParams ?: return@setOnTouchListener false
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialWidth = params.width
+                    initialHeight = params.height
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val screenWidth = resources.displayMetrics.widthPixels
+                    val screenHeight = resources.displayMetrics.heightPixels
+                    val dx = (event.rawX - initialTouchX).toInt()
+                    val dy = (event.rawY - initialTouchY).toInt()
+
+                    val newWidth = (initialWidth + dx).coerceIn(minPanelWidthPx(), maxPanelWidthPx())
+                    val newHeight = (initialHeight + dy).coerceIn(minPanelHeightPx(), maxPanelHeightPx())
+
+                    params.width = newWidth.coerceAtMost((screenWidth - params.x).coerceAtLeast(minPanelWidthPx()))
+                    params.height = newHeight.coerceAtMost((screenHeight - params.y).coerceAtLeast(minPanelHeightPx()))
+                    panelView?.let { windowManager.updateViewLayout(it, params) }
+                    true
+                }
+
+                MotionEvent.ACTION_UP -> {
+                    persistPanelLayout()
+                    true
+                }
+
+                else -> false
+            }
+        }
+    }
+
     private fun createPanelView(): View {
-        val root = LinearLayout(this).apply {
+        val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.argb(235, 255, 255, 255))
             setPadding(dp(12), dp(12), dp(12), dp(12))
@@ -449,6 +593,7 @@ class OverlayService : Service() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
         }
+        attachPanelDragListener(header)
 
         val title = TextView(this).apply {
             text = "Raid Coach"
@@ -511,12 +656,47 @@ class OverlayService : Service() {
         }
         listViewRef = listView
 
+        val thumbnailSize = dp(THUMBNAIL_SIZE_DP)
+        val pendingThumbnailImage = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            layoutParams = FrameLayout.LayoutParams(thumbnailSize, thumbnailSize)
+        }
+        pendingThumbnailImageView = pendingThumbnailImage
+
+        val discardPendingButton = TextView(this).apply {
+            text = "✕"
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(200, 0, 0, 0))
+            }
+            layoutParams = FrameLayout.LayoutParams(dp(18), dp(18), Gravity.TOP or Gravity.END)
+            setOnClickListener { discardPendingCapture() }
+        }
+
+        val pendingThumbnailRow = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+            addView(pendingThumbnailImage)
+            addView(discardPendingButton)
+            visibility = View.GONE
+        }
+        pendingThumbnailContainer = pendingThumbnailRow
+
         val inputRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            )
+            ).apply { topMargin = dp(8) }
+        }
+
+        val cameraButton = Button(this).apply {
+            text = "📷"
+            setOnClickListener { onCameraButtonClicked() }
         }
 
         val input = EditText(this).apply {
@@ -528,22 +708,40 @@ class OverlayService : Service() {
             text = "Send"
             setOnClickListener {
                 val text = input.text.toString().trim()
-                if (text.isNotEmpty()) {
-                    input.text.clear()
-                    onSendManualMessage(text)
-                }
+                val attachedBitmap = pendingCaptureBitmap
+                if (text.isEmpty() && attachedBitmap == null) return@setOnClickListener
+                input.text.clear()
+                pendingCaptureBitmap = null
+                updatePendingThumbnailUi()
+                onSendManualMessage(text, attachedBitmap)
             }
         }
 
+        inputRow.addView(cameraButton)
         inputRow.addView(input)
         inputRow.addView(sendButton)
 
-        root.addView(header)
-        root.addView(controlsRow)
-        root.addView(listView)
-        root.addView(inputRow)
+        content.addView(header)
+        content.addView(controlsRow)
+        content.addView(listView)
+        content.addView(pendingThumbnailRow)
+        content.addView(inputRow)
 
-        return root
+        val resizeHandle = View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                setColor(Color.argb(160, 120, 120, 120))
+            }
+        }
+        attachPanelResizeListener(resizeHandle)
+
+        return FrameLayout(this).apply {
+            addView(content, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            addView(
+                resizeHandle,
+                FrameLayout.LayoutParams(dp(RESIZE_HANDLE_SIZE_DP), dp(RESIZE_HANDLE_SIZE_DP), Gravity.BOTTOM or Gravity.END)
+            )
+        }
     }
 
     private fun onModeButtonClicked() {
@@ -577,10 +775,74 @@ class OverlayService : Service() {
 
     private fun pauseButtonLabel(): String = if (isAutoPaused) "Resume" else "Pause"
 
-    private fun onSendManualMessage(text: String) {
-        appendDisplayMessage("You", text)
-        appendHistory(ApiMessage(role = "user", blocks = listOf(ApiContentBlock(type = "text", text = text))))
+    private fun onSendManualMessage(text: String, imageBitmap: Bitmap?) {
+        val blocks = mutableListOf<ApiContentBlock>()
+        var thumbnail: Bitmap? = null
+
+        if (imageBitmap != null) {
+            blocks.add(ApiContentBlock(type = "image", imageBase64 = bitmapToJpegBase64(imageBitmap)))
+            thumbnail = Bitmap.createScaledBitmap(imageBitmap, dp(THUMBNAIL_SIZE_DP), dp(THUMBNAIL_SIZE_DP), true)
+        }
+        if (text.isNotEmpty()) {
+            blocks.add(ApiContentBlock(type = "text", text = text))
+        }
+        if (blocks.isEmpty()) return
+
+        val label = if (imageBitmap != null) text.ifEmpty { "Screenshot" } else text
+        appendDisplayMessage("You", label, thumbnail)
+        appendHistory(ApiMessage(role = "user", blocks = blocks))
+        imageBitmap?.recycle()
+
         serviceScope.launch { requestCoachReply() }
+    }
+
+    private fun onCameraButtonClicked() {
+        if (mediaProjection == null) {
+            pendingAction = { captureForPendingAttachment() }
+            launchProjectionConsent()
+        } else {
+            captureForPendingAttachment()
+        }
+    }
+
+    private fun captureForPendingAttachment() {
+        if (isCapturingPendingAttachment) return
+        isCapturingPendingAttachment = true
+
+        serviceScope.launch {
+            try {
+                val bitmap = captureWithOverlayHidden()
+                if (bitmap == null) {
+                    appendDisplayMessage("Coach", "Couldn't capture the screen. Try again.")
+                    return@launch
+                }
+                val downscaled = downscaleForUpload(bitmap)
+                if (downscaled !== bitmap) bitmap.recycle()
+
+                pendingCaptureBitmap?.recycle()
+                pendingCaptureBitmap = downscaled
+                updatePendingThumbnailUi()
+            } finally {
+                isCapturingPendingAttachment = false
+            }
+        }
+    }
+
+    private fun discardPendingCapture() {
+        pendingCaptureBitmap?.recycle()
+        pendingCaptureBitmap = null
+        updatePendingThumbnailUi()
+    }
+
+    private fun updatePendingThumbnailUi() {
+        val bitmap = pendingCaptureBitmap
+        if (bitmap == null) {
+            pendingThumbnailContainer?.visibility = View.GONE
+            pendingThumbnailImageView?.setImageBitmap(null)
+        } else {
+            pendingThumbnailImageView?.setImageBitmap(bitmap)
+            pendingThumbnailContainer?.visibility = View.VISIBLE
+        }
     }
 
     // endregion
@@ -616,8 +878,8 @@ class OverlayService : Service() {
         }
     }
 
-    private fun appendDisplayMessage(label: String, text: String) {
-        displayMessages.add("$label: $text")
+    private fun appendDisplayMessage(label: String, text: String, thumbnail: Bitmap? = null) {
+        displayMessages.add(DisplayEntry(label, text, thumbnail))
         messageAdapter.notifyDataSetChanged()
         listViewRef?.setSelection(messageAdapter.count - 1)
     }
@@ -703,6 +965,52 @@ class OverlayService : Service() {
     // endregion
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private inner class ChatAdapter : BaseAdapter() {
+        override fun getCount(): Int = displayMessages.size
+        override fun getItem(position: Int): DisplayEntry = displayMessages[position]
+        override fun getItemId(position: Int): Long = position.toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val entry = displayMessages[position]
+            val context = parent.context
+
+            val row = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(dp(4), dp(4), dp(4), dp(4))
+            }
+
+            entry.thumbnail?.let { thumbnail ->
+                row.addView(
+                    ImageView(context).apply {
+                        setImageBitmap(thumbnail)
+                        scaleType = ImageView.ScaleType.CENTER_CROP
+                        layoutParams = LinearLayout.LayoutParams(dp(THUMBNAIL_SIZE_DP), dp(THUMBNAIL_SIZE_DP)).apply {
+                            marginEnd = dp(8)
+                        }
+                    }
+                )
+            }
+
+            val textColumn = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            textColumn.addView(
+                TextView(context).apply { text = "${entry.label}: ${entry.text}" }
+            )
+            textColumn.addView(
+                TextView(context).apply {
+                    text = timeFormatter.format(Date(entry.timestamp))
+                    textSize = 10f
+                    setTextColor(Color.GRAY)
+                }
+            )
+
+            row.addView(textColumn)
+            return row
+        }
+    }
 }
 
 private inline fun <reified T : Parcelable> Intent.parcelableExtraCompat(name: String): T? =
