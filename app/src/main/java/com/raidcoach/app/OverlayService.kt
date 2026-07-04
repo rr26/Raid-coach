@@ -101,6 +101,21 @@ class OverlayService : Service() {
             "screenshots. Give short, actionable advice: what to do this turn, misplays you spot, better skill " +
             "order, team/gear/build improvements, alternative strategies. Be concise — 2-3 sentences unless I " +
             "ask for more. If a screenshot shows nothing actionable, reply exactly 'watching'."
+
+        private const val WEB_SEARCH_CLAUSE = "You have web search. When asked about a champion's skills, " +
+            "ratings, or recommended builds, search for current guides (e.g. 'HellHades [champion name]', " +
+            "'ayumilove [champion name]') to verify skills and find the most-used meta builds before advising. " +
+            "Combine that with my roster and inventory when recommending. Don't search for questions you can " +
+            "answer from the screenshot or conversation alone."
+
+        private const val CHAMPION_CACHE_INSTRUCTION = "When your answer includes newly web-searched " +
+            "information about a specific champion's skills, ratings, or build, end your reply on its own new " +
+            "line with exactly: [CHAMPION_CACHE: <Champion Name> | <one-sentence summary of their key " +
+            "skills/build>]. Omit this line entirely if you didn't search, or if the answer isn't about a " +
+            "specific champion's skills/build."
+
+        private val CHAMPION_CACHE_REGEX = Regex("""\[CHAMPION_CACHE:\s*([^|]+)\|\s*(.+?)]""")
+        private const val CHAMPION_CACHE_MAX_AGE_MS = 30L * 24 * 60 * 60 * 1000
     }
 
     private val overlayWindowType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -1299,23 +1314,74 @@ class OverlayService : Service() {
 
         showTypingIndicator()
 
-        val systemPrompt = buildSystemPrompt(securePrefs.getBriefing().orEmpty())
-        val result = AnthropicClient.sendMessage(apiKey, systemPrompt, history)
+        val webSearchEnabled = securePrefs.getWebSearchEnabled()
+        val cachedContext = if (webSearchEnabled) buildCachedChampionContext() else null
+        val systemPrompt = buildSystemPrompt(securePrefs.getBriefing().orEmpty(), webSearchEnabled, cachedContext)
+        val result = AnthropicClient.sendMessage(apiKey, systemPrompt, history, webSearchEnabled)
 
         hideTypingIndicator()
 
         result.onSuccess { reply ->
-            appendHistory(ApiMessage(role = "assistant", blocks = listOf(ApiContentBlock(type = "text", text = reply))))
-            val isWatching = reply.trim() == WATCHING_REPLY
-            appendDisplayMessage("Coach", reply, isWatching = isWatching)
-            if (!isExpanded && !isWatching) showReplyNotification(reply)
+            val (displayText, championCache) = extractChampionCache(reply.text)
+            appendHistory(ApiMessage(role = "assistant", blocks = listOf(ApiContentBlock(type = "text", text = displayText))))
+            val isWatching = displayText.trim() == WATCHING_REPLY
+            appendDisplayMessage("Coach", displayText, isWatching = isWatching, usedWebSearch = reply.usedWebSearch)
+            if (!isExpanded && !isWatching) showReplyNotification(displayText)
+
+            championCache?.let { (name, summary) ->
+                serviceScope.launch(Dispatchers.IO) {
+                    chatDatabase.championCacheDao().upsert(
+                        ChampionCacheEntity(name, summary, System.currentTimeMillis())
+                    )
+                }
+            }
         }.onFailure { error ->
             appendDisplayMessage("Coach", error.message ?: "Something went wrong.", isError = true)
         }
     }
 
-    private fun buildSystemPrompt(briefing: String): String =
-        if (briefing.isBlank()) SYSTEM_PROMPT_PREFIX else "$SYSTEM_PROMPT_PREFIX\n\n$briefing"
+    private fun buildSystemPrompt(briefing: String, webSearchEnabled: Boolean, cachedContext: String?): String {
+        val parts = mutableListOf(SYSTEM_PROMPT_PREFIX)
+        if (webSearchEnabled) {
+            parts.add(WEB_SEARCH_CLAUSE)
+            parts.add(CHAMPION_CACHE_INSTRUCTION)
+        }
+        if (!cachedContext.isNullOrBlank()) parts.add(cachedContext)
+        if (briefing.isNotBlank()) parts.add(briefing)
+        return parts.joinToString("\n\n")
+    }
+
+    // Looks for a cached champion whose name appears in the latest outgoing user text and is
+    // still fresh (< 30 days old); returns a context note to inject, or null if nothing applies.
+    private suspend fun buildCachedChampionContext(): String? {
+        val lastUserText = history.lastOrNull { it.role == "user" }
+            ?.blocks
+            ?.filter { it.type == "text" }
+            ?.joinToString(" ") { it.text.orEmpty() }
+            ?: return null
+        if (lastUserText.isBlank()) return null
+
+        val cached = withContext(Dispatchers.IO) { chatDatabase.championCacheDao().getAll() }
+        val match = cached.firstOrNull { entry -> lastUserText.contains(entry.championName, ignoreCase = true) }
+            ?: return null
+
+        val ageMillis = System.currentTimeMillis() - match.timestamp
+        if (ageMillis > CHAMPION_CACHE_MAX_AGE_MS) return null
+
+        val ageDays = ageMillis / (24 * 60 * 60 * 1000)
+        return "Cached research on ${match.championName} from $ageDays day(s) ago: ${match.summary}\n" +
+            "Prefer this over a new web search unless it seems stale or I explicitly ask for updated/fresh info."
+    }
+
+    // Strips the model's own [CHAMPION_CACHE: ...] marker (if present) from the display text and
+    // returns it separately so it can be stored, without ever showing the raw marker to the user.
+    private fun extractChampionCache(rawText: String): Pair<String, Pair<String, String>?> {
+        val match = CHAMPION_CACHE_REGEX.find(rawText) ?: return rawText to null
+        val name = match.groupValues[1].trim()
+        val summary = match.groupValues[2].trim()
+        val cleaned = rawText.replace(match.value, "").trim()
+        return cleaned to (name to summary)
+    }
 
     private fun appendHistory(message: ApiMessage) {
         history.add(message)
@@ -1364,9 +1430,10 @@ class OverlayService : Service() {
         thumbnail: Bitmap? = null,
         isWatching: Boolean = false,
         isError: Boolean = false,
-        isAutoScreenshot: Boolean = false
+        isAutoScreenshot: Boolean = false,
+        usedWebSearch: Boolean = false
     ) {
-        val entry = DisplayEntry(label, text, thumbnail, isWatching = isWatching, isError = isError)
+        val entry = DisplayEntry(label, text, thumbnail, isWatching = isWatching, isError = isError, usedWebSearch = usedWebSearch)
         displayMessages.add(entry)
         messageAdapter.notifyDataSetChanged()
         listViewRef?.setSelection(messageAdapter.count - 1)
@@ -1562,6 +1629,16 @@ class OverlayService : Service() {
                     }
                 }
             )
+
+            if (entry.usedWebSearch) {
+                textColumn.addView(
+                    TextView(context).apply {
+                        text = "🔎 searched the web"
+                        textSize = 10f
+                        setTextColor(Color.rgb(180, 180, 185))
+                    }
+                )
+            }
 
             if (!entry.isTyping) {
                 textColumn.addView(

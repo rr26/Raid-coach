@@ -35,10 +35,17 @@ class SecurePrefs private constructor(context: Context) {
         preferences.edit().putString(KEY_BRIEFING, value).apply()
     }
 
+    fun getWebSearchEnabled(): Boolean = preferences.getBoolean(KEY_WEB_SEARCH_ENABLED, true)
+
+    fun setWebSearchEnabled(value: Boolean) {
+        preferences.edit().putBoolean(KEY_WEB_SEARCH_ENABLED, value).apply()
+    }
+
     companion object {
         private const val PREFS_FILE_NAME = "raid_coach_secure_prefs"
         private const val KEY_API_KEY = "api_key"
         private const val KEY_BRIEFING = "coach_briefing"
+        private const val KEY_WEB_SEARCH_ENABLED = "web_search_enabled"
 
         @Volatile
         private var instance: SecurePrefs? = null

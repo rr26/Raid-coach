@@ -23,5 +23,11 @@ data class DisplayEntry(
     val timestamp: Long = System.currentTimeMillis(),
     val isTyping: Boolean = false,
     val isWatching: Boolean = false,
-    val isError: Boolean = false
+    val isError: Boolean = false,
+    val usedWebSearch: Boolean = false
+)
+
+data class AnthropicReply(
+    val text: String,
+    val usedWebSearch: Boolean
 )
