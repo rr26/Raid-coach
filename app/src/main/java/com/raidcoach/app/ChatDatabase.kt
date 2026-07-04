@@ -5,10 +5,15 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 
-@Database(entities = [ChatMessageEntity::class], version = 1, exportSchema = false)
+@Database(
+    entities = [ChatMessageEntity::class, ChampionCacheEntity::class],
+    version = 2,
+    exportSchema = false
+)
 abstract class ChatDatabase : RoomDatabase() {
 
     abstract fun chatMessageDao(): ChatMessageDao
+    abstract fun championCacheDao(): ChampionCacheDao
 
     companion object {
         @Volatile
@@ -20,7 +25,7 @@ abstract class ChatDatabase : RoomDatabase() {
                     context.applicationContext,
                     ChatDatabase::class.java,
                     "raid_coach_chat.db"
-                ).build().also { instance = it }
+                ).fallbackToDestructiveMigration().build().also { instance = it }
             }
     }
 }

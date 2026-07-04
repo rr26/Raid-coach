@@ -26,8 +26,9 @@ object AnthropicClient {
     suspend fun sendMessage(
         apiKey: String,
         systemPrompt: String,
-        history: List<ApiMessage>
-    ): Result<String> = withContext(Dispatchers.IO) {
+        history: List<ApiMessage>,
+        webSearchEnabled: Boolean
+    ): Result<AnthropicReply> = withContext(Dispatchers.IO) {
         runCatching {
             try {
                 val connection = URL(ENDPOINT).openConnection() as HttpURLConnection
@@ -40,7 +41,7 @@ object AnthropicClient {
                     connection.setRequestProperty("anthropic-version", ANTHROPIC_VERSION)
                     connection.setRequestProperty("content-type", "application/json")
 
-                    val body = buildRequestBody(systemPrompt, history)
+                    val body = buildRequestBody(systemPrompt, history, webSearchEnabled)
                     connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
 
                     val responseCode = connection.responseCode
@@ -74,7 +75,11 @@ object AnthropicClient {
         }
     }
 
-    private fun buildRequestBody(systemPrompt: String, history: List<ApiMessage>): JSONObject {
+    private fun buildRequestBody(
+        systemPrompt: String,
+        history: List<ApiMessage>,
+        webSearchEnabled: Boolean
+    ): JSONObject {
         val messagesArray = JSONArray()
         for (message in history) {
             val contentArray = JSONArray()
@@ -107,22 +112,43 @@ object AnthropicClient {
             )
         }
 
-        return JSONObject()
+        val requestBody = JSONObject()
             .put("model", MODEL)
             .put("max_tokens", MAX_TOKENS)
             .put("system", systemPrompt)
             .put("messages", messagesArray)
+
+        if (webSearchEnabled) {
+            requestBody.put(
+                "tools",
+                JSONArray().put(
+                    JSONObject()
+                        .put("type", "web_search_20250305")
+                        .put("name", "web_search")
+                )
+            )
+        }
+
+        return requestBody
     }
 
-    private fun parseReply(responseText: String): String {
+    // The web_search tool is server-executed: a single response can mix text blocks with
+    // server_tool_use/web_search_tool_result blocks. Only "text" blocks are shown to the user;
+    // any other block type just flags that a search happened.
+    private fun parseReply(responseText: String): AnthropicReply {
         val content = JSONObject(responseText).getJSONArray("content")
-        val builder = StringBuilder()
+        val textBuilder = StringBuilder()
+        var usedWebSearch = false
+
         for (i in 0 until content.length()) {
             val block = content.getJSONObject(i)
             if (block.optString("type") == "text") {
-                builder.append(block.optString("text"))
+                textBuilder.append(block.optString("text"))
+            } else {
+                usedWebSearch = true
             }
         }
-        return builder.toString().trim()
+
+        return AnthropicReply(textBuilder.toString().trim(), usedWebSearch)
     }
 }
