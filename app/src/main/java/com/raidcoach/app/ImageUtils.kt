@@ -22,9 +22,9 @@ fun downscaleForUpload(bitmap: Bitmap): Bitmap {
     return Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
 }
 
-fun bitmapToJpegBase64(bitmap: Bitmap): String {
+fun bitmapToJpegBase64(bitmap: Bitmap, quality: Int = JPEG_QUALITY): String {
     val output = ByteArrayOutputStream()
-    bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, output)
+    bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)
     return Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
 }
 

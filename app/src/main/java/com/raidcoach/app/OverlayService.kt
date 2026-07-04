@@ -90,6 +90,13 @@ class OverlayService : Service() {
         private const val PANEL_BG_B = 22
         private const val BUBBLE_ROW_BG_ALPHA = 60
 
+        private const val DETAIL_SCAN_JPEG_QUALITY = 90
+        private const val MIN_CROP_SIZE_DP = 48
+        private const val CROP_PREVIEW_WIDTH_FRACTION = 0.85f
+        private const val CROP_PREVIEW_HEIGHT_FRACTION = 0.6f
+        private const val DETAIL_SCAN_PREFIX = "This is a high-detail crop of a champion's stat panel — read " +
+            "all names and numbers precisely"
+
         private const val SYSTEM_PROMPT_PREFIX = "You are a Raid: Shadow Legends coach watching my gameplay via " +
             "screenshots. Give short, actionable advice: what to do this turn, misplays you spot, better skill " +
             "order, team/gear/build improvements, alternative strategies. Be concise — 2-3 sentences unless I " +
@@ -119,6 +126,7 @@ class OverlayService : Service() {
     private var pauseButtonRef: Button? = null
     private var pendingThumbnailContainer: View? = null
     private var pendingThumbnailImageView: ImageView? = null
+    private var pendingThumbnailLabelView: TextView? = null
     private var panelOpacityPercent = DEFAULT_PANEL_OPACITY_PERCENT
 
     private var mediaProjection: MediaProjection? = null
@@ -130,7 +138,13 @@ class OverlayService : Service() {
     private var lastAutoFrame: Bitmap? = null
     private var pendingAction: (() -> Unit)? = null
     private var pendingCaptureBitmap: Bitmap? = null
+    private var pendingCaptureIsDetailScan = false
     private var isCapturingPendingAttachment = false
+
+    private var scanChoiceView: View? = null
+    private var cropOverlayView: View? = null
+    private var cropFullResBitmap: Bitmap? = null
+    private var cropPreviewBitmap: Bitmap? = null
 
     private val displayMessages = mutableListOf<DisplayEntry>()
     private lateinit var messageAdapter: ChatAdapter
@@ -215,10 +229,14 @@ class OverlayService : Service() {
         captureController?.release()
         lastAutoFrame?.recycle()
         pendingCaptureBitmap?.recycle()
+        cropFullResBitmap?.recycle()
+        cropPreviewBitmap?.recycle()
         displayMessages.forEach { it.thumbnail?.recycle() }
 
         runCatching { windowManager.removeView(bubbleView) }
         panelView?.let { view -> runCatching { windowManager.removeView(view) } }
+        scanChoiceView?.let { view -> runCatching { windowManager.removeView(view) } }
+        cropOverlayView?.let { view -> runCatching { windowManager.removeView(view) } }
     }
 
     // region Media projection
@@ -748,6 +766,19 @@ class OverlayService : Service() {
             setOnClickListener { discardPendingCapture() }
         }
 
+        val pendingThumbnailLabel = TextView(this).apply {
+            text = "Detail scan"
+            setTextColor(Color.WHITE)
+            textSize = 9f
+            setPadding(dp(4), dp(2), dp(4), dp(2))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(4).toFloat()
+                setColor(Color.argb(200, 0, 0, 0))
+            }
+            visibility = View.GONE
+        }
+        pendingThumbnailLabelView = pendingThumbnailLabel
+
         val pendingThumbnailRow = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -755,6 +786,11 @@ class OverlayService : Service() {
             ).apply { topMargin = dp(8) }
             addView(pendingThumbnailImage)
             addView(discardPendingButton)
+            addView(pendingThumbnailLabel, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.START
+            ))
             visibility = View.GONE
         }
         pendingThumbnailContainer = pendingThumbnailRow
@@ -784,11 +820,13 @@ class OverlayService : Service() {
             setOnClickListener {
                 val text = input.text.toString().trim()
                 val attachedBitmap = pendingCaptureBitmap
+                val isDetailScan = pendingCaptureIsDetailScan
                 if (text.isEmpty() && attachedBitmap == null) return@setOnClickListener
                 input.text.clear()
                 pendingCaptureBitmap = null
+                pendingCaptureIsDetailScan = false
                 updatePendingThumbnailUi()
-                onSendManualMessage(text, attachedBitmap)
+                onSendManualMessage(text, attachedBitmap, isDetailScan)
             }
         }
 
@@ -851,20 +889,36 @@ class OverlayService : Service() {
 
     private fun pauseButtonLabel(): String = if (isAutoPaused) "Resume" else "Pause"
 
-    private fun onSendManualMessage(text: String, imageBitmap: Bitmap?) {
+    private fun onSendManualMessage(text: String, imageBitmap: Bitmap?, isDetailScan: Boolean) {
         val blocks = mutableListOf<ApiContentBlock>()
         var thumbnail: Bitmap? = null
 
         if (imageBitmap != null) {
-            blocks.add(ApiContentBlock(type = "image", imageBase64 = bitmapToJpegBase64(imageBitmap)))
+            val encoded = if (isDetailScan) {
+                bitmapToJpegBase64(imageBitmap, DETAIL_SCAN_JPEG_QUALITY)
+            } else {
+                bitmapToJpegBase64(imageBitmap)
+            }
+            blocks.add(ApiContentBlock(type = "image", imageBase64 = encoded))
             thumbnail = Bitmap.createScaledBitmap(imageBitmap, dp(THUMBNAIL_SIZE_DP), dp(THUMBNAIL_SIZE_DP), true)
         }
-        if (text.isNotEmpty()) {
-            blocks.add(ApiContentBlock(type = "text", text = text))
+
+        val combinedText = when {
+            isDetailScan && text.isNotEmpty() -> "$DETAIL_SCAN_PREFIX $text"
+            isDetailScan -> DETAIL_SCAN_PREFIX
+            else -> text
+        }
+        if (combinedText.isNotEmpty()) {
+            blocks.add(ApiContentBlock(type = "text", text = combinedText))
         }
         if (blocks.isEmpty()) return
 
-        val label = if (imageBitmap != null) text.ifEmpty { "Screenshot" } else text
+        val label = when {
+            isDetailScan && text.isNotEmpty() -> "Detail scan: $text"
+            isDetailScan -> "Detail scan"
+            imageBitmap != null -> text.ifEmpty { "Screenshot" }
+            else -> text
+        }
         appendDisplayMessage("You", label, thumbnail)
         appendHistory(ApiMessage(role = "user", blocks = blocks))
         imageBitmap?.recycle()
@@ -873,6 +927,78 @@ class OverlayService : Service() {
     }
 
     private fun onCameraButtonClicked() {
+        showScanChoiceOverlay()
+    }
+
+    private fun showScanChoiceOverlay() {
+        removeScanChoiceOverlay()
+        val view = createScanChoiceView()
+        scanChoiceView = view
+        windowManager.addView(view, createScanChoiceParams())
+    }
+
+    private fun removeScanChoiceOverlay() {
+        scanChoiceView?.let { runCatching { windowManager.removeView(it) } }
+        scanChoiceView = null
+    }
+
+    private fun createScanChoiceParams(): WindowManager.LayoutParams {
+        return WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            overlayWindowType,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.CENTER
+        }
+    }
+
+    private fun createScanChoiceView(): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.argb(235, PANEL_BG_R, PANEL_BG_G, PANEL_BG_B))
+            }
+        }
+
+        val title = TextView(this).apply {
+            text = "Capture screenshot"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+        }
+
+        val quickButton = Button(this).apply {
+            text = "Quick"
+            setOnClickListener {
+                removeScanChoiceOverlay()
+                onQuickCaptureChosen()
+            }
+        }
+
+        val detailButton = Button(this).apply {
+            text = "Detail scan"
+            setOnClickListener {
+                removeScanChoiceOverlay()
+                onDetailScanChosen()
+            }
+        }
+
+        val cancelButton = Button(this).apply {
+            text = "Cancel"
+            setOnClickListener { removeScanChoiceOverlay() }
+        }
+
+        card.addView(title)
+        card.addView(quickButton)
+        card.addView(detailButton)
+        card.addView(cancelButton)
+        return card
+    }
+
+    private fun onQuickCaptureChosen() {
         if (mediaProjection == null) {
             pendingAction = { captureForPendingAttachment() }
             launchProjectionConsent()
@@ -897,6 +1023,7 @@ class OverlayService : Service() {
 
                 pendingCaptureBitmap?.recycle()
                 pendingCaptureBitmap = downscaled
+                pendingCaptureIsDetailScan = false
                 updatePendingThumbnailUi()
             } finally {
                 isCapturingPendingAttachment = false
@@ -904,9 +1031,245 @@ class OverlayService : Service() {
         }
     }
 
+    private fun onDetailScanChosen() {
+        if (mediaProjection == null) {
+            pendingAction = { startDetailScanCapture() }
+            launchProjectionConsent()
+        } else {
+            startDetailScanCapture()
+        }
+    }
+
+    private fun startDetailScanCapture() {
+        if (isCapturingPendingAttachment) return
+        isCapturingPendingAttachment = true
+
+        serviceScope.launch {
+            try {
+                val bitmap = captureWithOverlayHidden()
+                if (bitmap == null) {
+                    appendDisplayMessage("Coach", "Couldn't capture the screen. Try again.", isError = true)
+                    return@launch
+                }
+                showCropOverlay(bitmap)
+            } finally {
+                isCapturingPendingAttachment = false
+            }
+        }
+    }
+
+    private fun showCropOverlay(fullResBitmap: Bitmap) {
+        cropFullResBitmap = fullResBitmap
+        val view = createCropView(fullResBitmap)
+        cropOverlayView = view
+        windowManager.addView(view, createCropParams())
+    }
+
+    private fun removeCropOverlay(recycleSource: Boolean) {
+        cropOverlayView?.let { runCatching { windowManager.removeView(it) } }
+        cropOverlayView = null
+        cropPreviewBitmap?.recycle()
+        cropPreviewBitmap = null
+        if (recycleSource) {
+            cropFullResBitmap?.recycle()
+        }
+        cropFullResBitmap = null
+    }
+
+    private fun createCropParams(): WindowManager.LayoutParams {
+        val screenWidth = resources.displayMetrics.widthPixels
+        val screenHeight = resources.displayMetrics.heightPixels
+        return WindowManager.LayoutParams(
+            (screenWidth * 0.92f).toInt(),
+            (screenHeight * 0.85f).toInt(),
+            overlayWindowType,
+            0,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.CENTER
+        }
+    }
+
+    private fun createCropView(fullResBitmap: Bitmap): View {
+        val maxPreviewWidth = (resources.displayMetrics.widthPixels * CROP_PREVIEW_WIDTH_FRACTION).toInt()
+        val maxPreviewHeight = (resources.displayMetrics.heightPixels * CROP_PREVIEW_HEIGHT_FRACTION).toInt()
+
+        val previewScale = minOf(
+            maxPreviewWidth.toFloat() / fullResBitmap.width,
+            maxPreviewHeight.toFloat() / fullResBitmap.height
+        )
+        val previewWidth = (fullResBitmap.width * previewScale).toInt()
+        val previewHeight = (fullResBitmap.height * previewScale).toInt()
+        val previewBitmap = Bitmap.createScaledBitmap(fullResBitmap, previewWidth, previewHeight, true)
+        cropPreviewBitmap = previewBitmap
+
+        val previewImage = ImageView(this).apply {
+            setImageBitmap(previewBitmap)
+        }
+
+        val cropResizeHandle = View(this).apply {
+            background = GradientDrawable().apply {
+                setColor(Color.argb(220, 255, 255, 255))
+            }
+        }
+
+        val cropRect = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                setStroke(dp(2), Color.WHITE)
+                setColor(Color.argb(50, 255, 255, 255))
+            }
+            addView(
+                cropResizeHandle,
+                FrameLayout.LayoutParams(dp(RESIZE_HANDLE_SIZE_DP), dp(RESIZE_HANDLE_SIZE_DP), Gravity.BOTTOM or Gravity.END)
+            )
+        }
+
+        val defaultCropWidth = previewWidth / 2
+        val cropRectParams = FrameLayout.LayoutParams(defaultCropWidth, previewHeight).apply {
+            leftMargin = previewWidth - defaultCropWidth
+            topMargin = 0
+        }
+
+        val previewContainer = FrameLayout(this).apply {
+            addView(previewImage, FrameLayout.LayoutParams(previewWidth, previewHeight))
+            addView(cropRect, cropRectParams)
+        }
+
+        attachCropDragListener(cropRect, previewWidth, previewHeight)
+        attachCropResizeListener(cropResizeHandle, cropRect, previewWidth, previewHeight)
+
+        val title = TextView(this).apply {
+            text = "Drag to select the area to send in detail"
+            setTextColor(Color.WHITE)
+            textSize = 13f
+        }
+
+        val cancelCropButton = Button(this).apply {
+            text = "Cancel"
+            setOnClickListener { removeCropOverlay(recycleSource = true) }
+        }
+
+        val useCropButton = Button(this).apply {
+            text = "Use crop"
+            setOnClickListener {
+                val params = cropRect.layoutParams as FrameLayout.LayoutParams
+                onCropConfirmed(fullResBitmap, previewScale, params.leftMargin, params.topMargin, params.width, params.height)
+            }
+        }
+
+        val buttonRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(12) }
+            addView(cancelCropButton)
+            addView(useCropButton)
+        }
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.argb(245, PANEL_BG_R, PANEL_BG_G, PANEL_BG_B))
+            }
+            addView(title)
+            addView(
+                previewContainer,
+                LinearLayout.LayoutParams(previewWidth, previewHeight).apply { topMargin = dp(8) }
+            )
+            addView(buttonRow)
+        }
+    }
+
+    private fun attachCropDragListener(rect: View, previewWidth: Int, previewHeight: Int) {
+        var initialLeft = 0
+        var initialTop = 0
+        var initialTouchX = 0f
+        var initialTouchY = 0f
+
+        rect.setOnTouchListener { _, event ->
+            val params = rect.layoutParams as FrameLayout.LayoutParams
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialLeft = params.leftMargin
+                    initialTop = params.topMargin
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (event.rawX - initialTouchX).toInt()
+                    val dy = (event.rawY - initialTouchY).toInt()
+                    params.leftMargin = (initialLeft + dx).coerceIn(0, (previewWidth - params.width).coerceAtLeast(0))
+                    params.topMargin = (initialTop + dy).coerceIn(0, (previewHeight - params.height).coerceAtLeast(0))
+                    rect.layoutParams = params
+                    true
+                }
+
+                else -> false
+            }
+        }
+    }
+
+    private fun attachCropResizeListener(handle: View, rect: View, previewWidth: Int, previewHeight: Int) {
+        var initialWidth = 0
+        var initialHeight = 0
+        var initialTouchX = 0f
+        var initialTouchY = 0f
+
+        handle.setOnTouchListener { _, event ->
+            val params = rect.layoutParams as FrameLayout.LayoutParams
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialWidth = params.width
+                    initialHeight = params.height
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (event.rawX - initialTouchX).toInt()
+                    val dy = (event.rawY - initialTouchY).toInt()
+                    val minSize = dp(MIN_CROP_SIZE_DP)
+                    params.width = (initialWidth + dx).coerceIn(minSize, previewWidth - params.leftMargin)
+                    params.height = (initialHeight + dy).coerceIn(minSize, previewHeight - params.topMargin)
+                    rect.layoutParams = params
+                    true
+                }
+
+                else -> false
+            }
+        }
+    }
+
+    private fun onCropConfirmed(fullResBitmap: Bitmap, previewScale: Float, left: Int, top: Int, width: Int, height: Int) {
+        val scaleBack = 1f / previewScale
+        val cropX = (left * scaleBack).toInt().coerceIn(0, fullResBitmap.width - 1)
+        val cropY = (top * scaleBack).toInt().coerceIn(0, fullResBitmap.height - 1)
+        val cropWidth = (width * scaleBack).toInt().coerceIn(1, fullResBitmap.width - cropX)
+        val cropHeight = (height * scaleBack).toInt().coerceIn(1, fullResBitmap.height - cropY)
+
+        val cropped = Bitmap.createBitmap(fullResBitmap, cropX, cropY, cropWidth, cropHeight)
+        val downscaled = downscaleForUpload(cropped)
+        if (downscaled !== cropped) cropped.recycle()
+
+        pendingCaptureBitmap?.recycle()
+        pendingCaptureBitmap = downscaled
+        pendingCaptureIsDetailScan = true
+        updatePendingThumbnailUi()
+
+        removeCropOverlay(recycleSource = true)
+    }
+
     private fun discardPendingCapture() {
         pendingCaptureBitmap?.recycle()
         pendingCaptureBitmap = null
+        pendingCaptureIsDetailScan = false
         updatePendingThumbnailUi()
     }
 
@@ -915,9 +1278,11 @@ class OverlayService : Service() {
         if (bitmap == null) {
             pendingThumbnailContainer?.visibility = View.GONE
             pendingThumbnailImageView?.setImageBitmap(null)
+            pendingThumbnailLabelView?.visibility = View.GONE
         } else {
             pendingThumbnailImageView?.setImageBitmap(bitmap)
             pendingThumbnailContainer?.visibility = View.VISIBLE
+            pendingThumbnailLabelView?.visibility = if (pendingCaptureIsDetailScan) View.VISIBLE else View.GONE
         }
     }
 
