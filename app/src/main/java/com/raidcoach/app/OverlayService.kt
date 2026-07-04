@@ -33,6 +33,7 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.SeekBar
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -81,6 +82,14 @@ class OverlayService : Service() {
         private const val RECENT_IMAGE_MESSAGE_COUNT = 3
         private const val WATCHING_REPLY = "watching"
 
+        private const val MIN_PANEL_OPACITY_PERCENT = 30
+        private const val MAX_PANEL_OPACITY_PERCENT = 100
+        private const val DEFAULT_PANEL_OPACITY_PERCENT = 68
+        private const val PANEL_BG_R = 18
+        private const val PANEL_BG_G = 18
+        private const val PANEL_BG_B = 22
+        private const val BUBBLE_ROW_BG_ALPHA = 60
+
         private const val SYSTEM_PROMPT_PREFIX = "You are a Raid: Shadow Legends coach watching my gameplay via " +
             "screenshots. Give short, actionable advice: what to do this turn, misplays you spot, better skill " +
             "order, team/gear/build improvements, alternative strategies. Be concise — 2-3 sentences unless I " +
@@ -95,6 +104,7 @@ class OverlayService : Service() {
     private lateinit var securePrefs: SecurePrefs
     private lateinit var panelLayoutPrefs: PanelLayoutPrefs
     private lateinit var mediaProjectionManager: MediaProjectionManager
+    private lateinit var chatDatabase: ChatDatabase
 
     private lateinit var bubbleView: View
     private lateinit var bubbleParams: WindowManager.LayoutParams
@@ -102,12 +112,14 @@ class OverlayService : Service() {
 
     private var panelView: View? = null
     private var panelParams: WindowManager.LayoutParams? = null
+    private var panelContentView: LinearLayout? = null
     private var isExpanded = false
     private var listViewRef: ListView? = null
     private var modeButtonRef: Button? = null
     private var pauseButtonRef: Button? = null
     private var pendingThumbnailContainer: View? = null
     private var pendingThumbnailImageView: ImageView? = null
+    private var panelOpacityPercent = DEFAULT_PANEL_OPACITY_PERCENT
 
     private var mediaProjection: MediaProjection? = null
     private var mediaProjectionTypeActive = false
@@ -149,6 +161,8 @@ class OverlayService : Service() {
         mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         securePrefs = SecurePrefs.getInstance(this)
         panelLayoutPrefs = PanelLayoutPrefs.getInstance(this)
+        chatDatabase = ChatDatabase.getInstance(this)
+        panelOpacityPercent = panelLayoutPrefs.getOpacityPercent(DEFAULT_PANEL_OPACITY_PERCENT)
         messageAdapter = ChatAdapter()
 
         bubbleView = createBubbleView()
@@ -156,6 +170,7 @@ class OverlayService : Service() {
         windowManager.addView(bubbleView, bubbleParams)
 
         startAutoCaptureLoop()
+        loadPersistedHistory()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -268,7 +283,7 @@ class OverlayService : Service() {
 
         previous?.recycle()
         lastAutoFrame = bitmap
-        sendCapturedFrame(bitmap, "Auto-screenshot sent")
+        sendCapturedFrame(bitmap, "Auto-screenshot sent", isAutoScreenshot = true)
     }
 
     private fun performImmediateCapture() {
@@ -278,7 +293,7 @@ class OverlayService : Service() {
                 appendDisplayMessage("Coach", "Couldn't capture the screen. Try again.", isError = true)
                 return@launch
             }
-            sendCapturedFrame(bitmap, "[Screenshot]")
+            sendCapturedFrame(bitmap, "[Screenshot]", isAutoScreenshot = false)
             bitmap.recycle()
         }
     }
@@ -305,9 +320,9 @@ class OverlayService : Service() {
         panelView?.visibility = View.VISIBLE
     }
 
-    private suspend fun sendCapturedFrame(bitmap: Bitmap, label: String) {
+    private suspend fun sendCapturedFrame(bitmap: Bitmap, label: String, isAutoScreenshot: Boolean) {
         val thumbnail = Bitmap.createScaledBitmap(bitmap, dp(THUMBNAIL_SIZE_DP), dp(THUMBNAIL_SIZE_DP), true)
-        appendDisplayMessage("You", label, thumbnail)
+        appendDisplayMessage("You", label, thumbnail, isAutoScreenshot = isAutoScreenshot)
 
         val scaled = downscaleForUpload(bitmap)
         val base64 = withContext(Dispatchers.Default) { bitmapToJpegBase64(scaled) }
@@ -501,6 +516,11 @@ class OverlayService : Service() {
         panelLayoutPrefs.save(params.x, params.y, params.width, params.height)
     }
 
+    private fun applyPanelOpacity() {
+        val alpha = (panelOpacityPercent / 100f * 255).toInt().coerceIn(0, 255)
+        panelContentView?.setBackgroundColor(Color.argb(alpha, PANEL_BG_R, PANEL_BG_G, PANEL_BG_B))
+    }
+
     private fun attachPanelDragListener(handle: View) {
         var initialX = 0
         var initialY = 0
@@ -585,9 +605,10 @@ class OverlayService : Service() {
     private fun createPanelView(): View {
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.argb(235, 255, 255, 255))
             setPadding(dp(12), dp(12), dp(12), dp(12))
         }
+        panelContentView = content
+        applyPanelOpacity()
 
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -601,6 +622,7 @@ class OverlayService : Service() {
         val title = TextView(this).apply {
             text = "Raid Coach"
             textSize = 16f
+            setTextColor(Color.WHITE)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
 
@@ -629,6 +651,46 @@ class OverlayService : Service() {
         header.addView(clearButton)
         header.addView(settingsButton)
         header.addView(collapseButton)
+
+        val opacityRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4) }
+        }
+
+        val opacityLabel = TextView(this).apply {
+            text = "Opacity"
+            setTextColor(Color.rgb(200, 200, 205))
+            textSize = 12f
+        }
+
+        val opacitySeekBar = SeekBar(this).apply {
+            min = MIN_PANEL_OPACITY_PERCENT
+            max = MAX_PANEL_OPACITY_PERCENT
+            progress = panelOpacityPercent
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dp(8)
+            }
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                    if (!fromUser) return
+                    panelOpacityPercent = progress
+                    applyPanelOpacity()
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar) = Unit
+
+                override fun onStopTrackingTouch(seekBar: SeekBar) {
+                    panelLayoutPrefs.setOpacityPercent(panelOpacityPercent)
+                }
+            })
+        }
+
+        opacityRow.addView(opacityLabel)
+        opacityRow.addView(opacitySeekBar)
 
         val controlsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -662,6 +724,8 @@ class OverlayService : Service() {
                 1f
             ).apply { topMargin = dp(8) }
             adapter = messageAdapter
+            divider = null
+            dividerHeight = dp(6)
         }
         listViewRef = listView
 
@@ -710,6 +774,8 @@ class OverlayService : Service() {
 
         val input = EditText(this).apply {
             hint = "Ask the coach"
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.rgb(180, 180, 185))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
 
@@ -731,6 +797,7 @@ class OverlayService : Service() {
         inputRow.addView(sendButton)
 
         content.addView(header)
+        content.addView(opacityRow)
         content.addView(controlsRow)
         content.addView(listView)
         content.addView(pendingThumbnailRow)
@@ -931,11 +998,59 @@ class OverlayService : Service() {
         text: String,
         thumbnail: Bitmap? = null,
         isWatching: Boolean = false,
-        isError: Boolean = false
+        isError: Boolean = false,
+        isAutoScreenshot: Boolean = false
     ) {
-        displayMessages.add(DisplayEntry(label, text, thumbnail, isWatching = isWatching, isError = isError))
+        val entry = DisplayEntry(label, text, thumbnail, isWatching = isWatching, isError = isError)
+        displayMessages.add(entry)
         messageAdapter.notifyDataSetChanged()
         listViewRef?.setSelection(messageAdapter.count - 1)
+
+        if (!isError) {
+            persistEntry(entry, isAutoScreenshot)
+        }
+    }
+
+    private fun persistEntry(entry: DisplayEntry, isAutoScreenshot: Boolean) {
+        val role = if (entry.label == "You") "user" else "assistant"
+        val thumbnail = entry.thumbnail
+        serviceScope.launch(Dispatchers.IO) {
+            val imagePath = thumbnail?.let { ThumbnailStorage.save(this@OverlayService, it, entry.timestamp) }
+            chatDatabase.chatMessageDao().insert(
+                ChatMessageEntity(
+                    role = role,
+                    text = entry.text,
+                    imagePath = imagePath,
+                    timestamp = entry.timestamp,
+                    isAutoScreenshot = isAutoScreenshot
+                )
+            )
+        }
+    }
+
+    // Only for chat-log continuity across restarts — the live API-bound `history` list still
+    // starts empty each service instance and is capped/stripped exactly as before.
+    private fun loadPersistedHistory() {
+        serviceScope.launch {
+            val entities = withContext(Dispatchers.IO) { chatDatabase.chatMessageDao().getAll() }
+            if (entities.isEmpty()) return@launch
+
+            val loaded = withContext(Dispatchers.IO) {
+                entities.map { entity ->
+                    DisplayEntry(
+                        label = if (entity.role == "user") "You" else "Coach",
+                        text = entity.text,
+                        thumbnail = entity.imagePath?.let { ThumbnailStorage.load(it) },
+                        timestamp = entity.timestamp,
+                        isWatching = entity.role == "assistant" && entity.text.trim() == WATCHING_REPLY
+                    )
+                }
+            }
+
+            displayMessages.addAll(loaded)
+            messageAdapter.notifyDataSetChanged()
+            listViewRef?.setSelection(messageAdapter.count - 1)
+        }
     }
 
     private fun onClearConversationClicked() {
@@ -944,6 +1059,11 @@ class OverlayService : Service() {
         history.clear()
         typingEntry = null
         messageAdapter.notifyDataSetChanged()
+
+        serviceScope.launch(Dispatchers.IO) {
+            chatDatabase.chatMessageDao().deleteAll()
+            ThumbnailStorage.clearAll(this@OverlayService)
+        }
     }
 
     // endregion
@@ -1039,7 +1159,11 @@ class OverlayService : Service() {
 
             val row = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
-                setPadding(dp(4), dp(4), dp(4), dp(4))
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(8).toFloat()
+                    setColor(Color.argb(BUBBLE_ROW_BG_ALPHA, 255, 255, 255))
+                }
             }
 
             entry.thumbnail?.let { thumbnail ->
@@ -1063,12 +1187,13 @@ class OverlayService : Service() {
                 TextView(context).apply {
                     text = if (entry.isTyping) "${entry.label} is typing…" else "${entry.label}: ${entry.text}"
                     when {
-                        entry.isError -> setTextColor(Color.rgb(198, 40, 40))
-                        entry.isTyping -> setTextColor(Color.GRAY)
+                        entry.isError -> setTextColor(Color.rgb(255, 138, 128))
+                        entry.isTyping -> setTextColor(Color.rgb(200, 200, 205))
                         entry.isWatching -> {
-                            setTextColor(Color.GRAY)
+                            setTextColor(Color.rgb(200, 200, 205))
                             textSize = 12f
                         }
+                        else -> setTextColor(Color.WHITE)
                     }
                 }
             )
@@ -1078,7 +1203,7 @@ class OverlayService : Service() {
                     TextView(context).apply {
                         text = timeFormatter.format(Date(entry.timestamp))
                         textSize = 10f
-                        setTextColor(Color.GRAY)
+                        setTextColor(Color.rgb(180, 180, 185))
                     }
                 )
             }

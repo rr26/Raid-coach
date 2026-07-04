@@ -22,12 +22,19 @@ class PanelLayoutPrefs private constructor(context: Context) {
             .apply()
     }
 
+    fun getOpacityPercent(default: Int): Int = prefs.getInt(KEY_OPACITY, default)
+
+    fun setOpacityPercent(value: Int) {
+        prefs.edit().putInt(KEY_OPACITY, value).apply()
+    }
+
     companion object {
         private const val PREFS_FILE_NAME = "panel_layout_prefs"
         private const val KEY_X = "panel_x"
         private const val KEY_Y = "panel_y"
         private const val KEY_WIDTH = "panel_width"
         private const val KEY_HEIGHT = "panel_height"
+        private const val KEY_OPACITY = "panel_opacity_percent"
 
         @Volatile
         private var instance: PanelLayoutPrefs? = null
