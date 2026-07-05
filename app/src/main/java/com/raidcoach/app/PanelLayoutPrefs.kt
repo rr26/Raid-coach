@@ -28,6 +28,12 @@ class PanelLayoutPrefs private constructor(context: Context) {
         prefs.edit().putInt(KEY_OPACITY, value).apply()
     }
 
+    fun getActiveTopic(default: String): String = prefs.getString(KEY_ACTIVE_TOPIC, default) ?: default
+
+    fun setActiveTopic(value: String) {
+        prefs.edit().putString(KEY_ACTIVE_TOPIC, value).apply()
+    }
+
     companion object {
         private const val PREFS_FILE_NAME = "panel_layout_prefs"
         private const val KEY_X = "panel_x"
@@ -35,6 +41,7 @@ class PanelLayoutPrefs private constructor(context: Context) {
         private const val KEY_WIDTH = "panel_width"
         private const val KEY_HEIGHT = "panel_height"
         private const val KEY_OPACITY = "panel_opacity_percent"
+        private const val KEY_ACTIVE_TOPIC = "active_topic"
 
         @Volatile
         private var instance: PanelLayoutPrefs? = null

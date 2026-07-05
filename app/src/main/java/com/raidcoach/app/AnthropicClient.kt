@@ -27,7 +27,8 @@ object AnthropicClient {
         apiKey: String,
         systemPrompt: String,
         history: List<ApiMessage>,
-        webSearchEnabled: Boolean
+        webSearchEnabled: Boolean,
+        maxTokens: Int = MAX_TOKENS
     ): Result<AnthropicReply> = withContext(Dispatchers.IO) {
         runCatching {
             try {
@@ -41,7 +42,7 @@ object AnthropicClient {
                     connection.setRequestProperty("anthropic-version", ANTHROPIC_VERSION)
                     connection.setRequestProperty("content-type", "application/json")
 
-                    val body = buildRequestBody(systemPrompt, history, webSearchEnabled)
+                    val body = buildRequestBody(systemPrompt, history, webSearchEnabled, maxTokens)
                     connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
 
                     val responseCode = connection.responseCode
@@ -78,7 +79,8 @@ object AnthropicClient {
     private fun buildRequestBody(
         systemPrompt: String,
         history: List<ApiMessage>,
-        webSearchEnabled: Boolean
+        webSearchEnabled: Boolean,
+        maxTokens: Int
     ): JSONObject {
         val messagesArray = JSONArray()
         for (message in history) {
@@ -114,7 +116,7 @@ object AnthropicClient {
 
         val requestBody = JSONObject()
             .put("model", MODEL)
-            .put("max_tokens", MAX_TOKENS)
+            .put("max_tokens", maxTokens)
             .put("system", systemPrompt)
             .put("messages", messagesArray)
 

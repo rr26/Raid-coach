@@ -6,14 +6,31 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 
 @Database(
-    entities = [ChatMessageEntity::class, ChampionCacheEntity::class],
-    version = 2,
+    entities = [
+        ChatMessageEntity::class,
+        ChampionCacheEntity::class,
+        TopicEntity::class,
+        TopicSummaryEntity::class,
+        DungeonProgressEntity::class,
+        SavedTeamEntity::class,
+        AccountMetaEntity::class,
+        GoalEntity::class,
+        DailyPriorityEntity::class
+    ],
+    version = 4,
     exportSchema = false
 )
 abstract class ChatDatabase : RoomDatabase() {
 
     abstract fun chatMessageDao(): ChatMessageDao
     abstract fun championCacheDao(): ChampionCacheDao
+    abstract fun topicDao(): TopicDao
+    abstract fun topicSummaryDao(): TopicSummaryDao
+    abstract fun dungeonProgressDao(): DungeonProgressDao
+    abstract fun savedTeamDao(): SavedTeamDao
+    abstract fun accountMetaDao(): AccountMetaDao
+    abstract fun goalDao(): GoalDao
+    abstract fun dailyPriorityDao(): DailyPriorityDao
 
     companion object {
         @Volatile

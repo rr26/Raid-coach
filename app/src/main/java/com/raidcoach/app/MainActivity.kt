@@ -10,6 +10,7 @@ import android.provider.Settings
 import android.view.Gravity
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -36,9 +37,21 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { onStartOverlayClicked() }
         }
 
+        val accountButton = Button(this).apply {
+            text = "My account"
+            setOnClickListener { startActivity(Intent(this@MainActivity, AccountActivity::class.java)) }
+        }
+
+        val buttonColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            addView(startOverlayButton)
+            addView(accountButton)
+        }
+
         val root = FrameLayout(this).apply {
             addView(
-                startOverlayButton,
+                buttonColumn,
                 FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.WRAP_CONTENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT,
