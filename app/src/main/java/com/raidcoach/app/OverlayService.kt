@@ -30,6 +30,7 @@ import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
@@ -53,6 +54,14 @@ import java.util.Locale
 import kotlin.math.abs
 
 class OverlayService : Service() {
+
+    private class TopicState {
+        val displayMessages = mutableListOf<DisplayEntry>()
+        val history = mutableListOf<ApiMessage>()
+        var typingEntry: DisplayEntry? = null
+        var pinnedSummary: String? = null
+        var isLoaded = false
+    }
 
     companion object {
         const val ACTION_STOP = "com.raidcoach.app.action.STOP_OVERLAY"
@@ -116,6 +125,16 @@ class OverlayService : Service() {
 
         private val CHAMPION_CACHE_REGEX = Regex("""\[CHAMPION_CACHE:\s*([^|]+)\|\s*(.+?)]""")
         private const val CHAMPION_CACHE_MAX_AGE_MS = 30L * 24 * 60 * 60 * 1000
+
+        private val DEFAULT_TOPICS = listOf(
+            "General", "Clan Boss", "Hydra", "Fire Knight", "Dragon", "Spider", "Ice Golem", "Arena"
+        )
+
+        private const val SUMMARY_MAX_TOKENS = 220
+        private const val SUMMARY_SYSTEM_PROMPT_PREFIX = "You are maintaining a running summary of the best " +
+            "current setup discussed for a specific Raid: Shadow Legends dungeon/mode, based only on the " +
+            "conversation so far. Write ONLY a concise 3-5 line summary: team composition, key stats/gear, and " +
+            "main tips. No preamble, no markdown, just the summary lines. Dungeon/mode: "
     }
 
     private val overlayWindowType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -144,6 +163,17 @@ class OverlayService : Service() {
     private var pendingThumbnailLabelView: TextView? = null
     private var panelOpacityPercent = DEFAULT_PANEL_OPACITY_PERCENT
 
+    private var tabBarRowView: LinearLayout? = null
+    private var pinnedSummaryContainer: View? = null
+    private var pinnedSummaryHeaderView: TextView? = null
+    private var pinnedSummaryBodyView: TextView? = null
+    private var pinnedSummaryExpanded = true
+    private var topicOverlayView: View? = null
+
+    private val topics = mutableListOf<String>()
+    private var currentTopic = DEFAULT_TOPICS.first()
+    private val topicStates = mutableMapOf<String, TopicState>()
+
     private var mediaProjection: MediaProjection? = null
     private var mediaProjectionTypeActive = false
     private var captureController: ScreenCaptureController? = null
@@ -161,11 +191,8 @@ class OverlayService : Service() {
     private var cropFullResBitmap: Bitmap? = null
     private var cropPreviewBitmap: Bitmap? = null
 
-    private val displayMessages = mutableListOf<DisplayEntry>()
     private lateinit var messageAdapter: ChatAdapter
-    private val history = mutableListOf<ApiMessage>()
     private val timeFormatter = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
-    private var typingEntry: DisplayEntry? = null
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -199,7 +226,7 @@ class OverlayService : Service() {
         windowManager.addView(bubbleView, bubbleParams)
 
         startAutoCaptureLoop()
-        loadPersistedHistory()
+        loadTopics()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -246,13 +273,376 @@ class OverlayService : Service() {
         pendingCaptureBitmap?.recycle()
         cropFullResBitmap?.recycle()
         cropPreviewBitmap?.recycle()
-        displayMessages.forEach { it.thumbnail?.recycle() }
+        topicStates.values.forEach { state -> state.displayMessages.forEach { it.thumbnail?.recycle() } }
 
         runCatching { windowManager.removeView(bubbleView) }
         panelView?.let { view -> runCatching { windowManager.removeView(view) } }
         scanChoiceView?.let { view -> runCatching { windowManager.removeView(view) } }
         cropOverlayView?.let { view -> runCatching { windowManager.removeView(view) } }
+        topicOverlayView?.let { view -> runCatching { windowManager.removeView(view) } }
     }
+
+    // region Topics
+
+    private fun topicState(topic: String): TopicState = topicStates.getOrPut(topic) { TopicState() }
+
+    private fun loadTopics() {
+        serviceScope.launch {
+            val entities = withContext(Dispatchers.IO) { chatDatabase.topicDao().getAll() }
+            if (entities.isEmpty()) {
+                val seeded = DEFAULT_TOPICS.mapIndexed { index, name -> TopicEntity(name, index) }
+                withContext(Dispatchers.IO) { chatDatabase.topicDao().insertAll(seeded) }
+                topics.addAll(DEFAULT_TOPICS)
+            } else {
+                topics.addAll(entities.sortedBy { it.sortOrder }.map { it.name })
+            }
+
+            val savedTopic = panelLayoutPrefs.getActiveTopic(topics.first())
+            currentTopic = if (topics.contains(savedTopic)) savedTopic else topics.first()
+
+            ensureTopicLoaded(currentTopic)
+            rebuildTabBar()
+        }
+    }
+
+    // Loads a topic's persisted chat log and pinned summary from Room the first time it's visited.
+    private fun ensureTopicLoaded(topic: String) {
+        val state = topicState(topic)
+        if (state.isLoaded) return
+        state.isLoaded = true
+
+        serviceScope.launch {
+            val entities = withContext(Dispatchers.IO) { chatDatabase.chatMessageDao().getByTopic(topic) }
+            if (entities.isNotEmpty()) {
+                val loaded = withContext(Dispatchers.IO) {
+                    entities.map { entity ->
+                        DisplayEntry(
+                            label = if (entity.role == "user") "You" else "Coach",
+                            text = entity.text,
+                            thumbnail = entity.imagePath?.let { ThumbnailStorage.load(it) },
+                            timestamp = entity.timestamp,
+                            isWatching = entity.role == "assistant" && entity.text.trim() == WATCHING_REPLY
+                        )
+                    }
+                }
+                state.displayMessages.addAll(0, loaded)
+                if (topic == currentTopic) {
+                    messageAdapter.notifyDataSetChanged()
+                    listViewRef?.setSelection(messageAdapter.count - 1)
+                }
+            }
+
+            val summaryEntity = withContext(Dispatchers.IO) { chatDatabase.topicSummaryDao().get(topic) }
+            state.pinnedSummary = summaryEntity?.summary
+            if (topic == currentTopic) updatePinnedSummaryUi()
+        }
+    }
+
+    private fun switchToTopic(topic: String) {
+        if (topic == currentTopic) return
+        currentTopic = topic
+        panelLayoutPrefs.setActiveTopic(topic)
+        ensureTopicLoaded(topic)
+        rebuildTabBar()
+        messageAdapter.notifyDataSetChanged()
+        listViewRef?.setSelection((messageAdapter.count - 1).coerceAtLeast(0))
+        updatePinnedSummaryUi()
+    }
+
+    private fun createTopic(name: String) {
+        if (topics.contains(name)) {
+            switchToTopic(name)
+            return
+        }
+        topics.add(name)
+        serviceScope.launch(Dispatchers.IO) {
+            chatDatabase.topicDao().insert(TopicEntity(name, topics.size - 1))
+        }
+        switchToTopic(name)
+        rebuildTabBar()
+    }
+
+    private fun renameTopic(oldName: String, newName: String) {
+        if (oldName == newName || topics.contains(newName)) return
+
+        val index = topics.indexOf(oldName)
+        if (index == -1) return
+        topics[index] = newName
+
+        topicStates.remove(oldName)?.let { topicStates[newName] = it }
+        if (currentTopic == oldName) {
+            currentTopic = newName
+            panelLayoutPrefs.setActiveTopic(newName)
+        }
+
+        serviceScope.launch(Dispatchers.IO) {
+            chatDatabase.chatMessageDao().renameTopic(oldName, newName)
+            chatDatabase.topicSummaryDao().renameTopic(oldName, newName)
+            chatDatabase.topicDao().rename(oldName, newName)
+        }
+
+        rebuildTabBar()
+        updatePinnedSummaryUi()
+    }
+
+    private fun deleteTopic(topic: String) {
+        if (topics.size <= 1) return
+
+        val index = topics.indexOf(topic)
+        if (index == -1) return
+        topics.removeAt(index)
+        topicStates.remove(topic)?.displayMessages?.forEach { it.thumbnail?.recycle() }
+
+        if (currentTopic == topic) {
+            currentTopic = topics.getOrElse(index) { topics.first() }
+            panelLayoutPrefs.setActiveTopic(currentTopic)
+            ensureTopicLoaded(currentTopic)
+        }
+
+        serviceScope.launch(Dispatchers.IO) {
+            val entities = chatDatabase.chatMessageDao().getByTopic(topic)
+            entities.forEach { entity -> entity.imagePath?.let { ThumbnailStorage.delete(it) } }
+            chatDatabase.chatMessageDao().deleteByTopic(topic)
+            chatDatabase.topicSummaryDao().delete(topic)
+            chatDatabase.topicDao().delete(topic)
+        }
+
+        rebuildTabBar()
+        messageAdapter.notifyDataSetChanged()
+        updatePinnedSummaryUi()
+    }
+
+    private fun createTabBarView(): View {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        tabBarRowView = row
+        rebuildTabBar()
+        return HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(row)
+        }
+    }
+
+    private fun rebuildTabBar() {
+        val row = tabBarRowView ?: return
+        row.removeAllViews()
+
+        for (topic in topics) {
+            val isActive = topic == currentTopic
+            val chip = TextView(this).apply {
+                text = topic
+                textSize = 12f
+                setPadding(dp(10), dp(6), dp(10), dp(6))
+                setTextColor(if (isActive) Color.WHITE else Color.rgb(180, 180, 185))
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(14).toFloat()
+                    setColor(
+                        if (isActive) Color.argb(220, 33, 150, 243) else Color.argb(120, 90, 90, 96)
+                    )
+                }
+                setOnClickListener { switchToTopic(topic) }
+                setOnLongClickListener {
+                    showTopicOptionsOverlay(topic)
+                    true
+                }
+            }
+            row.addView(
+                chip,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginEnd = dp(6) }
+            )
+        }
+
+        val addChip = TextView(this).apply {
+            text = "+"
+            textSize = 14f
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                cornerRadius = dp(14).toFloat()
+                setColor(Color.argb(160, 120, 120, 120))
+            }
+            setOnClickListener { showCreateTopicOverlay() }
+        }
+        row.addView(addChip)
+    }
+
+    private fun removeTopicOverlay() {
+        topicOverlayView?.let { runCatching { windowManager.removeView(it) } }
+        topicOverlayView = null
+    }
+
+    private fun showTopicOptionsOverlay(topic: String) {
+        removeTopicOverlay()
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.argb(235, PANEL_BG_R, PANEL_BG_G, PANEL_BG_B))
+            }
+        }
+
+        val title = TextView(this).apply {
+            text = topic
+            setTextColor(Color.WHITE)
+            textSize = 14f
+        }
+
+        val renameButton = Button(this).apply {
+            text = "Rename"
+            setOnClickListener {
+                removeTopicOverlay()
+                showTopicNameEntryOverlay(topic) { newName -> renameTopic(topic, newName) }
+            }
+        }
+
+        val deleteButton = Button(this).apply {
+            text = "Delete"
+            setOnClickListener {
+                removeTopicOverlay()
+                deleteTopic(topic)
+            }
+        }
+
+        val cancelButton = Button(this).apply {
+            text = "Cancel"
+            setOnClickListener { removeTopicOverlay() }
+        }
+
+        card.addView(title)
+        card.addView(renameButton)
+        card.addView(deleteButton)
+        card.addView(cancelButton)
+
+        topicOverlayView = card
+        windowManager.addView(card, createScanChoiceParams())
+    }
+
+    private fun showCreateTopicOverlay() {
+        showTopicNameEntryOverlay(null) { newName -> createTopic(newName) }
+    }
+
+    private fun showTopicNameEntryOverlay(existingName: String?, onConfirm: (String) -> Unit) {
+        removeTopicOverlay()
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.argb(235, PANEL_BG_R, PANEL_BG_G, PANEL_BG_B))
+            }
+        }
+
+        val title = TextView(this).apply {
+            text = if (existingName != null) "Rename tab" else "New tab"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+        }
+
+        val input = EditText(this).apply {
+            setText(existingName.orEmpty())
+            hint = "Tab name"
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.rgb(180, 180, 185))
+        }
+
+        val saveButton = Button(this).apply {
+            text = "Save"
+            setOnClickListener {
+                val name = input.text.toString().trim()
+                if (name.isNotEmpty()) {
+                    removeTopicOverlay()
+                    onConfirm(name)
+                }
+            }
+        }
+
+        val cancelButton = Button(this).apply {
+            text = "Cancel"
+            setOnClickListener { removeTopicOverlay() }
+        }
+
+        card.addView(title)
+        card.addView(input)
+        card.addView(saveButton)
+        card.addView(cancelButton)
+
+        topicOverlayView = card
+        windowManager.addView(card, createNameEntryParams())
+    }
+
+    private fun createNameEntryParams(): WindowManager.LayoutParams {
+        return WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            overlayWindowType,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.CENTER
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        }
+    }
+
+    // endregion
+
+    // region Pinned summary
+
+    private fun updatePinnedSummaryUi() {
+        val summary = topicState(currentTopic).pinnedSummary
+        if (summary.isNullOrBlank()) {
+            pinnedSummaryContainer?.visibility = View.GONE
+            return
+        }
+        pinnedSummaryContainer?.visibility = View.VISIBLE
+        pinnedSummaryHeaderView?.text = "📌 $currentTopic setup ${if (pinnedSummaryExpanded) "▾" else "▸"}"
+        pinnedSummaryBodyView?.text = summary
+        pinnedSummaryBodyView?.visibility = if (pinnedSummaryExpanded) View.VISIBLE else View.GONE
+    }
+
+    // Silent, cheap, text-only follow-up request that keeps a short "current best setup" summary
+    // for this topic up to date. Never shown in the chat log itself, and failures are ignored.
+    private fun refreshPinnedSummary(topic: String) {
+        serviceScope.launch {
+            val apiKey = securePrefs.getApiKey()
+            if (apiKey.isNullOrBlank()) return@launch
+
+            val strippedHistory = stripImagesForSummary(topicState(topic).history)
+            if (strippedHistory.isEmpty()) return@launch
+
+            val systemPrompt = SUMMARY_SYSTEM_PROMPT_PREFIX + topic
+            val result = AnthropicClient.sendMessage(
+                apiKey, systemPrompt, strippedHistory, webSearchEnabled = false, maxTokens = SUMMARY_MAX_TOKENS
+            )
+
+            result.onSuccess { reply ->
+                val summary = reply.text.trim()
+                if (summary.isEmpty()) return@onSuccess
+
+                topicState(topic).pinnedSummary = summary
+                if (topic == currentTopic) updatePinnedSummaryUi()
+
+                withContext(Dispatchers.IO) {
+                    chatDatabase.topicSummaryDao().upsert(
+                        TopicSummaryEntity(topic, summary, System.currentTimeMillis())
+                    )
+                }
+            }
+        }
+    }
+
+    private fun stripImagesForSummary(history: List<ApiMessage>): List<ApiMessage> {
+        return history.mapNotNull { message ->
+            val textBlocks = message.blocks.filter { it.type == "text" }
+            if (textBlocks.isEmpty()) null else message.copy(blocks = textBlocks)
+        }
+    }
+
+    // endregion
 
     // region Media projection
 
@@ -281,7 +671,7 @@ class OverlayService : Service() {
         if (captureMode == CaptureMode.AUTO) {
             captureMode = CaptureMode.ON_DEMAND
         }
-        appendDisplayMessage("Coach", "Screen capture permission was not granted.", isError = true)
+        appendDisplayMessage(currentTopic, "Coach", "Screen capture permission was not granted.", isError = true)
         refreshControlsUi()
         updateBubbleIndicator()
     }
@@ -306,6 +696,7 @@ class OverlayService : Service() {
     }
 
     private suspend fun performAutoCapture() {
+        val topic = currentTopic
         val bitmap = captureWithOverlayHidden() ?: return
 
         val previous = lastAutoFrame
@@ -316,17 +707,18 @@ class OverlayService : Service() {
 
         previous?.recycle()
         lastAutoFrame = bitmap
-        sendCapturedFrame(bitmap, "Auto-screenshot sent", isAutoScreenshot = true)
+        sendCapturedFrame(topic, bitmap, "Auto-screenshot sent", isAutoScreenshot = true)
     }
 
     private fun performImmediateCapture() {
+        val topic = currentTopic
         serviceScope.launch {
             val bitmap = captureWithOverlayHidden()
             if (bitmap == null) {
-                appendDisplayMessage("Coach", "Couldn't capture the screen. Try again.", isError = true)
+                appendDisplayMessage(topic, "Coach", "Couldn't capture the screen. Try again.", isError = true)
                 return@launch
             }
-            sendCapturedFrame(bitmap, "[Screenshot]", isAutoScreenshot = false)
+            sendCapturedFrame(topic, bitmap, "[Screenshot]", isAutoScreenshot = false)
             bitmap.recycle()
         }
     }
@@ -353,16 +745,16 @@ class OverlayService : Service() {
         panelView?.visibility = View.VISIBLE
     }
 
-    private suspend fun sendCapturedFrame(bitmap: Bitmap, label: String, isAutoScreenshot: Boolean) {
+    private suspend fun sendCapturedFrame(topic: String, bitmap: Bitmap, label: String, isAutoScreenshot: Boolean) {
         val thumbnail = Bitmap.createScaledBitmap(bitmap, dp(THUMBNAIL_SIZE_DP), dp(THUMBNAIL_SIZE_DP), true)
-        appendDisplayMessage("You", label, thumbnail, isAutoScreenshot = isAutoScreenshot)
+        appendDisplayMessage(topic, "You", label, thumbnail, isAutoScreenshot = isAutoScreenshot)
 
         val scaled = downscaleForUpload(bitmap)
         val base64 = withContext(Dispatchers.Default) { bitmapToJpegBase64(scaled) }
         if (scaled !== bitmap) scaled.recycle()
 
-        appendHistory(ApiMessage(role = "user", blocks = listOf(ApiContentBlock(type = "image", imageBase64 = base64))))
-        requestCoachReply()
+        appendHistory(topic, ApiMessage(role = "user", blocks = listOf(ApiContentBlock(type = "image", imageBase64 = base64))))
+        requestCoachReply(topic)
     }
 
     // endregion
@@ -685,6 +1077,40 @@ class OverlayService : Service() {
         header.addView(settingsButton)
         header.addView(collapseButton)
 
+        val pinnedSummaryHeader = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+        }
+        pinnedSummaryHeaderView = pinnedSummaryHeader
+
+        val pinnedSummaryBody = TextView(this).apply {
+            setTextColor(Color.rgb(220, 220, 225))
+            textSize = 11f
+            setPadding(dp(8), 0, dp(8), dp(8))
+        }
+        pinnedSummaryBodyView = pinnedSummaryBody
+
+        val pinnedSummaryCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                cornerRadius = dp(8).toFloat()
+                setColor(Color.argb(90, 255, 200, 0))
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
+            addView(pinnedSummaryHeader)
+            addView(pinnedSummaryBody)
+            setOnClickListener {
+                pinnedSummaryExpanded = !pinnedSummaryExpanded
+                updatePinnedSummaryUi()
+            }
+            visibility = View.GONE
+        }
+        pinnedSummaryContainer = pinnedSummaryCard
+
         val opacityRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -841,7 +1267,7 @@ class OverlayService : Service() {
                 pendingCaptureBitmap = null
                 pendingCaptureIsDetailScan = false
                 updatePendingThumbnailUi()
-                onSendManualMessage(text, attachedBitmap, isDetailScan)
+                onSendManualMessage(currentTopic, text, attachedBitmap, isDetailScan)
             }
         }
 
@@ -850,11 +1276,15 @@ class OverlayService : Service() {
         inputRow.addView(sendButton)
 
         content.addView(header)
+        content.addView(createTabBarView())
+        content.addView(pinnedSummaryCard)
         content.addView(opacityRow)
         content.addView(controlsRow)
         content.addView(listView)
         content.addView(pendingThumbnailRow)
         content.addView(inputRow)
+
+        updatePinnedSummaryUi()
 
         val resizeHandle = View(this).apply {
             background = GradientDrawable().apply {
@@ -904,7 +1334,7 @@ class OverlayService : Service() {
 
     private fun pauseButtonLabel(): String = if (isAutoPaused) "Resume" else "Pause"
 
-    private fun onSendManualMessage(text: String, imageBitmap: Bitmap?, isDetailScan: Boolean) {
+    private fun onSendManualMessage(topic: String, text: String, imageBitmap: Bitmap?, isDetailScan: Boolean) {
         val blocks = mutableListOf<ApiContentBlock>()
         var thumbnail: Bitmap? = null
 
@@ -934,11 +1364,11 @@ class OverlayService : Service() {
             imageBitmap != null -> text.ifEmpty { "Screenshot" }
             else -> text
         }
-        appendDisplayMessage("You", label, thumbnail)
-        appendHistory(ApiMessage(role = "user", blocks = blocks))
+        appendDisplayMessage(topic, "You", label, thumbnail)
+        appendHistory(topic, ApiMessage(role = "user", blocks = blocks))
         imageBitmap?.recycle()
 
-        serviceScope.launch { requestCoachReply() }
+        serviceScope.launch { requestCoachReply(topic) }
     }
 
     private fun onCameraButtonClicked() {
@@ -1030,7 +1460,7 @@ class OverlayService : Service() {
             try {
                 val bitmap = captureWithOverlayHidden()
                 if (bitmap == null) {
-                    appendDisplayMessage("Coach", "Couldn't capture the screen. Try again.", isError = true)
+                    appendDisplayMessage(currentTopic, "Coach", "Couldn't capture the screen. Try again.", isError = true)
                     return@launch
                 }
                 val downscaled = downscaleForUpload(bitmap)
@@ -1063,7 +1493,7 @@ class OverlayService : Service() {
             try {
                 val bitmap = captureWithOverlayHidden()
                 if (bitmap == null) {
-                    appendDisplayMessage("Coach", "Couldn't capture the screen. Try again.", isError = true)
+                    appendDisplayMessage(currentTopic, "Coach", "Couldn't capture the screen. Try again.", isError = true)
                     return@launch
                 }
                 showCropOverlay(bitmap)
@@ -1305,27 +1735,28 @@ class OverlayService : Service() {
 
     // region Coach conversation
 
-    private suspend fun requestCoachReply() {
+    private suspend fun requestCoachReply(topic: String) {
         val apiKey = securePrefs.getApiKey()
         if (apiKey.isNullOrBlank()) {
-            appendDisplayMessage("Coach", "No API key set. Open Settings to add one.", isError = true)
+            appendDisplayMessage(topic, "Coach", "No API key set. Open Settings to add one.", isError = true)
             return
         }
 
-        showTypingIndicator()
+        showTypingIndicator(topic)
 
         val webSearchEnabled = securePrefs.getWebSearchEnabled()
-        val cachedContext = if (webSearchEnabled) buildCachedChampionContext() else null
-        val systemPrompt = buildSystemPrompt(securePrefs.getBriefing().orEmpty(), webSearchEnabled, cachedContext)
-        val result = AnthropicClient.sendMessage(apiKey, systemPrompt, history, webSearchEnabled)
+        val cachedContext = if (webSearchEnabled) buildCachedChampionContext(topic) else null
+        val systemPrompt = buildSystemPrompt(securePrefs.getBriefing().orEmpty(), webSearchEnabled, cachedContext, topic)
+        val state = topicState(topic)
+        val result = AnthropicClient.sendMessage(apiKey, systemPrompt, state.history, webSearchEnabled)
 
-        hideTypingIndicator()
+        hideTypingIndicator(topic)
 
         result.onSuccess { reply ->
             val (displayText, championCache) = extractChampionCache(reply.text)
-            appendHistory(ApiMessage(role = "assistant", blocks = listOf(ApiContentBlock(type = "text", text = displayText))))
+            appendHistory(topic, ApiMessage(role = "assistant", blocks = listOf(ApiContentBlock(type = "text", text = displayText))))
             val isWatching = displayText.trim() == WATCHING_REPLY
-            appendDisplayMessage("Coach", displayText, isWatching = isWatching, usedWebSearch = reply.usedWebSearch)
+            appendDisplayMessage(topic, "Coach", displayText, isWatching = isWatching, usedWebSearch = reply.usedWebSearch)
             if (!isExpanded && !isWatching) showReplyNotification(displayText)
 
             championCache?.let { (name, summary) ->
@@ -1335,13 +1766,17 @@ class OverlayService : Service() {
                     )
                 }
             }
+
+            if (!isWatching) {
+                refreshPinnedSummary(topic)
+            }
         }.onFailure { error ->
-            appendDisplayMessage("Coach", error.message ?: "Something went wrong.", isError = true)
+            appendDisplayMessage(topic, "Coach", error.message ?: "Something went wrong.", isError = true)
         }
     }
 
-    private fun buildSystemPrompt(briefing: String, webSearchEnabled: Boolean, cachedContext: String?): String {
-        val parts = mutableListOf(SYSTEM_PROMPT_PREFIX)
+    private fun buildSystemPrompt(briefing: String, webSearchEnabled: Boolean, cachedContext: String?, topic: String): String {
+        val parts = mutableListOf(SYSTEM_PROMPT_PREFIX, "Current tab/focus: $topic.")
         if (webSearchEnabled) {
             parts.add(WEB_SEARCH_CLAUSE)
             parts.add(CHAMPION_CACHE_INSTRUCTION)
@@ -1351,10 +1786,10 @@ class OverlayService : Service() {
         return parts.joinToString("\n\n")
     }
 
-    // Looks for a cached champion whose name appears in the latest outgoing user text and is
-    // still fresh (< 30 days old); returns a context note to inject, or null if nothing applies.
-    private suspend fun buildCachedChampionContext(): String? {
-        val lastUserText = history.lastOrNull { it.role == "user" }
+    // Looks for a cached champion whose name appears in the latest outgoing user text of this
+    // topic and is still fresh (< 30 days old); returns a context note to inject, or null.
+    private suspend fun buildCachedChampionContext(topic: String): String? {
+        val lastUserText = topicState(topic).history.lastOrNull { it.role == "user" }
             ?.blocks
             ?.filter { it.type == "text" }
             ?.joinToString(" ") { it.text.orEmpty() }
@@ -1383,16 +1818,17 @@ class OverlayService : Service() {
         return cleaned to (name to summary)
     }
 
-    private fun appendHistory(message: ApiMessage) {
-        history.add(message)
-        while (history.size > MAX_HISTORY_MESSAGES) {
-            history.removeAt(0)
+    private fun appendHistory(topic: String, message: ApiMessage) {
+        val state = topicState(topic)
+        state.history.add(message)
+        while (state.history.size > MAX_HISTORY_MESSAGES) {
+            state.history.removeAt(0)
         }
-        stripOldImageBlocks()
+        stripOldImageBlocks(state.history)
     }
 
     // Keeps image data only on the most recent messages so payload size/memory don't grow unbounded.
-    private fun stripOldImageBlocks() {
+    private fun stripOldImageBlocks(history: MutableList<ApiMessage>) {
         val keepImagesFrom = (history.size - RECENT_IMAGE_MESSAGE_COUNT).coerceAtLeast(0)
         for (i in 0 until keepImagesFrom) {
             val message = history[i]
@@ -1410,21 +1846,28 @@ class OverlayService : Service() {
         }
     }
 
-    private fun showTypingIndicator() {
+    private fun showTypingIndicator(topic: String) {
+        val state = topicState(topic)
         val entry = DisplayEntry(label = "Coach", text = "typing…", isTyping = true)
-        typingEntry = entry
-        displayMessages.add(entry)
-        messageAdapter.notifyDataSetChanged()
-        listViewRef?.setSelection(messageAdapter.count - 1)
+        state.typingEntry = entry
+        state.displayMessages.add(entry)
+        if (topic == currentTopic) {
+            messageAdapter.notifyDataSetChanged()
+            listViewRef?.setSelection(messageAdapter.count - 1)
+        }
     }
 
-    private fun hideTypingIndicator() {
-        typingEntry?.let { displayMessages.remove(it) }
-        typingEntry = null
-        messageAdapter.notifyDataSetChanged()
+    private fun hideTypingIndicator(topic: String) {
+        val state = topicState(topic)
+        state.typingEntry?.let { state.displayMessages.remove(it) }
+        state.typingEntry = null
+        if (topic == currentTopic) {
+            messageAdapter.notifyDataSetChanged()
+        }
     }
 
     private fun appendDisplayMessage(
+        topic: String,
         label: String,
         text: String,
         thumbnail: Bitmap? = null,
@@ -1434,22 +1877,26 @@ class OverlayService : Service() {
         usedWebSearch: Boolean = false
     ) {
         val entry = DisplayEntry(label, text, thumbnail, isWatching = isWatching, isError = isError, usedWebSearch = usedWebSearch)
-        displayMessages.add(entry)
-        messageAdapter.notifyDataSetChanged()
-        listViewRef?.setSelection(messageAdapter.count - 1)
+        val state = topicState(topic)
+        state.displayMessages.add(entry)
+        if (topic == currentTopic) {
+            messageAdapter.notifyDataSetChanged()
+            listViewRef?.setSelection(messageAdapter.count - 1)
+        }
 
         if (!isError) {
-            persistEntry(entry, isAutoScreenshot)
+            persistEntry(topic, entry, isAutoScreenshot)
         }
     }
 
-    private fun persistEntry(entry: DisplayEntry, isAutoScreenshot: Boolean) {
+    private fun persistEntry(topic: String, entry: DisplayEntry, isAutoScreenshot: Boolean) {
         val role = if (entry.label == "You") "user" else "assistant"
         val thumbnail = entry.thumbnail
         serviceScope.launch(Dispatchers.IO) {
             val imagePath = thumbnail?.let { ThumbnailStorage.save(this@OverlayService, it, entry.timestamp) }
             chatDatabase.chatMessageDao().insert(
                 ChatMessageEntity(
+                    topic = topic,
                     role = role,
                     text = entry.text,
                     imagePath = imagePath,
@@ -1460,41 +1907,22 @@ class OverlayService : Service() {
         }
     }
 
-    // Only for chat-log continuity across restarts — the live API-bound `history` list still
-    // starts empty each service instance and is capped/stripped exactly as before.
-    private fun loadPersistedHistory() {
-        serviceScope.launch {
-            val entities = withContext(Dispatchers.IO) { chatDatabase.chatMessageDao().getAll() }
-            if (entities.isEmpty()) return@launch
-
-            val loaded = withContext(Dispatchers.IO) {
-                entities.map { entity ->
-                    DisplayEntry(
-                        label = if (entity.role == "user") "You" else "Coach",
-                        text = entity.text,
-                        thumbnail = entity.imagePath?.let { ThumbnailStorage.load(it) },
-                        timestamp = entity.timestamp,
-                        isWatching = entity.role == "assistant" && entity.text.trim() == WATCHING_REPLY
-                    )
-                }
-            }
-
-            displayMessages.addAll(loaded)
-            messageAdapter.notifyDataSetChanged()
-            listViewRef?.setSelection(messageAdapter.count - 1)
-        }
-    }
-
     private fun onClearConversationClicked() {
-        displayMessages.forEach { it.thumbnail?.recycle() }
-        displayMessages.clear()
-        history.clear()
-        typingEntry = null
+        val topic = currentTopic
+        val state = topicState(topic)
+        state.displayMessages.forEach { it.thumbnail?.recycle() }
+        state.displayMessages.clear()
+        state.history.clear()
+        state.typingEntry = null
+        state.pinnedSummary = null
         messageAdapter.notifyDataSetChanged()
+        updatePinnedSummaryUi()
 
         serviceScope.launch(Dispatchers.IO) {
-            chatDatabase.chatMessageDao().deleteAll()
-            ThumbnailStorage.clearAll(this@OverlayService)
+            val entities = chatDatabase.chatMessageDao().getByTopic(topic)
+            entities.forEach { entity -> entity.imagePath?.let { ThumbnailStorage.delete(it) } }
+            chatDatabase.chatMessageDao().deleteByTopic(topic)
+            chatDatabase.topicSummaryDao().delete(topic)
         }
     }
 
@@ -1581,12 +2009,14 @@ class OverlayService : Service() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private inner class ChatAdapter : BaseAdapter() {
-        override fun getCount(): Int = displayMessages.size
-        override fun getItem(position: Int): DisplayEntry = displayMessages[position]
+        private fun items(): List<DisplayEntry> = topicState(currentTopic).displayMessages
+
+        override fun getCount(): Int = items().size
+        override fun getItem(position: Int): DisplayEntry = items()[position]
         override fun getItemId(position: Int): Long = position.toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-            val entry = displayMessages[position]
+            val entry = items()[position]
             val context = parent.context
 
             val row = LinearLayout(context).apply {

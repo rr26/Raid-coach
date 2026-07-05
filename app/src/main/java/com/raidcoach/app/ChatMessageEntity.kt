@@ -6,6 +6,7 @@ import androidx.room.PrimaryKey
 @Entity(tableName = "chat_messages")
 data class ChatMessageEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val topic: String,
     val role: String,
     val text: String,
     val imagePath: String? = null,

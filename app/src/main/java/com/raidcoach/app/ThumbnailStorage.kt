@@ -22,6 +22,10 @@ object ThumbnailStorage {
 
     fun load(path: String): Bitmap? = runCatching { BitmapFactory.decodeFile(path) }.getOrNull()
 
+    fun delete(path: String) {
+        runCatching { File(path).delete() }
+    }
+
     fun clearAll(context: Context) {
         File(context.filesDir, DIR_NAME).listFiles()?.forEach { runCatching { it.delete() } }
     }
