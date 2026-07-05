@@ -28,6 +28,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.BaseAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
@@ -60,6 +61,7 @@ class OverlayService : Service() {
         val history = mutableListOf<ApiMessage>()
         var typingEntry: DisplayEntry? = null
         var pinnedSummary: String? = null
+        val goals = mutableListOf<GoalEntity>()
         var isLoaded = false
     }
 
@@ -124,7 +126,6 @@ class OverlayService : Service() {
             "specific champion's skills/build."
 
         private val CHAMPION_CACHE_REGEX = Regex("""\[CHAMPION_CACHE:\s*([^|]+)\|\s*(.+?)]""")
-        private const val CHAMPION_CACHE_MAX_AGE_MS = 30L * 24 * 60 * 60 * 1000
 
         private val DEFAULT_TOPICS = listOf(
             "General", "Clan Boss", "Hydra", "Fire Knight", "Dragon", "Spider", "Ice Golem", "Arena"
@@ -135,6 +136,20 @@ class OverlayService : Service() {
             "current setup discussed for a specific Raid: Shadow Legends dungeon/mode, based only on the " +
             "conversation so far. Write ONLY a concise 3-5 line summary: team composition, key stats/gear, and " +
             "main tips. No preamble, no markdown, just the summary lines. Dungeon/mode: "
+
+        private const val GOAL_PLAN_MAX_TOKENS = 500
+        private const val GOAL_PLAN_SYSTEM_SUFFIX = "You are helping plan a specific in-game goal for a Raid: " +
+            "Shadow Legends account, using the ACCOUNT STATE above. Given my ACCOUNT STATE, create a " +
+            "step-by-step plan for this goal: concrete milestones, which champions/gear to develop first, and " +
+            "what to check next session. Reply with ONLY a numbered list of steps, max 10. No preamble, no " +
+            "extra text."
+
+        private const val DAILY_PRIORITY_MAX_TOKENS = 350
+        private const val DAILY_PRIORITY_SYSTEM_SUFFIX = "Using the ACCOUNT STATE and active goals above, " +
+            "recommend the top 3 most valuable actions for today's play session, in priority order. Be " +
+            "specific: which dungeon stage, which champion to level/gear, which event to push, and why. Keep " +
+            "each point to one sentence. No preamble, no extra text."
+        private const val DAILY_PRIORITY_USER_MESSAGE = "What should I do today?"
     }
 
     private val overlayWindowType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -169,6 +184,15 @@ class OverlayService : Service() {
     private var pinnedSummaryBodyView: TextView? = null
     private var pinnedSummaryExpanded = true
     private var topicOverlayView: View? = null
+    private var goalOverlayView: View? = null
+
+    private var goalsRowContainer: View? = null
+    private var goalsRowView: LinearLayout? = null
+
+    private var dailyPriorityContainer: View? = null
+    private var dailyPriorityBodyView: TextView? = null
+    private var dailyPriorityText: String? = null
+    private var isDailyPriorityLoading = false
 
     private val topics = mutableListOf<String>()
     private var currentTopic = DEFAULT_TOPICS.first()
@@ -227,6 +251,7 @@ class OverlayService : Service() {
 
         startAutoCaptureLoop()
         loadTopics()
+        loadDailyPriority()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -280,6 +305,7 @@ class OverlayService : Service() {
         scanChoiceView?.let { view -> runCatching { windowManager.removeView(view) } }
         cropOverlayView?.let { view -> runCatching { windowManager.removeView(view) } }
         topicOverlayView?.let { view -> runCatching { windowManager.removeView(view) } }
+        goalOverlayView?.let { view -> runCatching { windowManager.removeView(view) } }
     }
 
     // region Topics
@@ -335,6 +361,11 @@ class OverlayService : Service() {
             val summaryEntity = withContext(Dispatchers.IO) { chatDatabase.topicSummaryDao().get(topic) }
             state.pinnedSummary = summaryEntity?.summary
             if (topic == currentTopic) updatePinnedSummaryUi()
+
+            val goals = withContext(Dispatchers.IO) { chatDatabase.goalDao().getByTopic(topic) }
+            state.goals.clear()
+            state.goals.addAll(goals)
+            if (topic == currentTopic) rebuildGoalsRow()
         }
     }
 
@@ -347,6 +378,8 @@ class OverlayService : Service() {
         messageAdapter.notifyDataSetChanged()
         listViewRef?.setSelection((messageAdapter.count - 1).coerceAtLeast(0))
         updatePinnedSummaryUi()
+        rebuildGoalsRow()
+        updateDailyPriorityUi()
     }
 
     private fun createTopic(name: String) {
@@ -378,11 +411,14 @@ class OverlayService : Service() {
         serviceScope.launch(Dispatchers.IO) {
             chatDatabase.chatMessageDao().renameTopic(oldName, newName)
             chatDatabase.topicSummaryDao().renameTopic(oldName, newName)
+            chatDatabase.savedTeamDao().renameTopic(oldName, newName)
+            chatDatabase.goalDao().renameTopic(oldName, newName)
             chatDatabase.topicDao().rename(oldName, newName)
         }
 
         rebuildTabBar()
         updatePinnedSummaryUi()
+        rebuildGoalsRow()
     }
 
     private fun deleteTopic(topic: String) {
@@ -404,12 +440,15 @@ class OverlayService : Service() {
             entities.forEach { entity -> entity.imagePath?.let { ThumbnailStorage.delete(it) } }
             chatDatabase.chatMessageDao().deleteByTopic(topic)
             chatDatabase.topicSummaryDao().delete(topic)
+            chatDatabase.savedTeamDao().delete(topic)
+            chatDatabase.goalDao().deleteByTopic(topic)
             chatDatabase.topicDao().delete(topic)
         }
 
         rebuildTabBar()
         messageAdapter.notifyDataSetChanged()
         updatePinnedSummaryUi()
+        rebuildGoalsRow()
     }
 
     private fun createTabBarView(): View {
@@ -420,6 +459,18 @@ class OverlayService : Service() {
             isHorizontalScrollBarEnabled = false
             addView(row)
         }
+    }
+
+    private fun createGoalsRowView(): View {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        goalsRowView = row
+        val scrollView = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(row)
+        }
+        goalsRowContainer = scrollView
+        rebuildGoalsRow()
+        return scrollView
     }
 
     private fun rebuildTabBar() {
@@ -585,6 +636,327 @@ class OverlayService : Service() {
         ).apply {
             gravity = Gravity.CENTER
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        }
+    }
+
+    // endregion
+
+    // region Goals
+
+    private fun rebuildGoalsRow() {
+        val row = goalsRowView ?: return
+        row.removeAllViews()
+
+        val activeGoals = topicState(currentTopic).goals.filter { it.status == GoalStatus.ACTIVE }
+        goalsRowContainer?.visibility = if (activeGoals.isEmpty()) View.GONE else View.VISIBLE
+
+        for (goal in activeGoals) {
+            val steps = GoalPlanCodec.decode(goal.plan)
+            val progress = if (steps.isEmpty()) "" else " (${steps.count { it.done }}/${steps.size})"
+            val chip = TextView(this).apply {
+                text = "🎯 ${goal.title}$progress"
+                textSize = 12f
+                setPadding(dp(10), dp(6), dp(10), dp(6))
+                setTextColor(Color.WHITE)
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(14).toFloat()
+                    setColor(Color.argb(200, 123, 31, 162))
+                }
+                setOnClickListener { showGoalDetailOverlay(currentTopic, goal) }
+            }
+            row.addView(
+                chip,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginEnd = dp(6) }
+            )
+        }
+
+        val addChip = TextView(this).apply {
+            text = "+ Goal"
+            textSize = 12f
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                cornerRadius = dp(14).toFloat()
+                setColor(Color.argb(160, 120, 120, 120))
+            }
+            setOnClickListener { showCreateGoalOverlay() }
+        }
+        row.addView(addChip)
+    }
+
+    private fun removeGoalOverlay() {
+        goalOverlayView?.let { runCatching { windowManager.removeView(it) } }
+        goalOverlayView = null
+    }
+
+    private fun showCreateGoalOverlay() {
+        removeGoalOverlay()
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.argb(235, PANEL_BG_R, PANEL_BG_G, PANEL_BG_B))
+            }
+        }
+
+        val title = TextView(this).apply {
+            text = "New goal for $currentTopic"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+        }
+
+        val input = EditText(this).apply {
+            hint = "e.g. 2-key UNM Clan Boss"
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.rgb(180, 180, 185))
+        }
+
+        val saveButton = Button(this).apply {
+            text = "Create"
+            setOnClickListener {
+                val name = input.text.toString().trim()
+                if (name.isNotEmpty()) {
+                    removeGoalOverlay()
+                    createGoal(currentTopic, name)
+                }
+            }
+        }
+
+        val cancelButton = Button(this).apply {
+            text = "Cancel"
+            setOnClickListener { removeGoalOverlay() }
+        }
+
+        card.addView(title)
+        card.addView(input)
+        card.addView(saveButton)
+        card.addView(cancelButton)
+
+        goalOverlayView = card
+        windowManager.addView(card, createNameEntryParams())
+    }
+
+    private fun createGoal(topic: String, title: String) {
+        serviceScope.launch {
+            val newGoal = GoalEntity(title = title, topic = topic, createdAt = System.currentTimeMillis())
+            val id = withContext(Dispatchers.IO) { chatDatabase.goalDao().insert(newGoal) }
+            val goal = newGoal.copy(id = id)
+            topicState(topic).goals.add(goal)
+            if (topic == currentTopic) rebuildGoalsRow()
+            requestGoalPlan(topic, goal)
+        }
+    }
+
+    // Silent, cheap request: given the ACCOUNT STATE, ask for a concrete step-by-step plan for a
+    // freshly created goal. The reply is parsed into a checklist and never shown in the chat log.
+    private fun requestGoalPlan(topic: String, goal: GoalEntity) {
+        serviceScope.launch {
+            val apiKey = securePrefs.getApiKey()
+            if (apiKey.isNullOrBlank()) return@launch
+
+            val accountState = AccountStateBuilder.build(chatDatabase, topic)
+            val systemPrompt = "$accountState\n\n$GOAL_PLAN_SYSTEM_SUFFIX"
+            val userMessage = ApiMessage(role = "user", blocks = listOf(ApiContentBlock(type = "text", text = "Goal: ${goal.title}")))
+
+            val result = AnthropicClient.sendMessage(
+                apiKey, systemPrompt, listOf(userMessage), webSearchEnabled = false, maxTokens = GOAL_PLAN_MAX_TOKENS
+            )
+
+            result.onSuccess { reply ->
+                val steps = GoalPlanCodec.parsePlanText(reply.text)
+                if (steps.isEmpty()) return@onSuccess
+                val updated = goal.copy(plan = GoalPlanCodec.encode(steps))
+                withContext(Dispatchers.IO) { chatDatabase.goalDao().update(updated) }
+                replaceGoalInState(topic, updated)
+            }
+        }
+    }
+
+    private fun replaceGoalInState(topic: String, goal: GoalEntity) {
+        val state = topicState(topic)
+        val index = state.goals.indexOfFirst { it.id == goal.id }
+        if (index != -1) state.goals[index] = goal else state.goals.add(goal)
+        if (topic == currentTopic) rebuildGoalsRow()
+    }
+
+    private fun toggleGoalStep(topic: String, goal: GoalEntity, stepIndex: Int) {
+        val steps = GoalPlanCodec.decode(goal.plan).toMutableList()
+        if (stepIndex !in steps.indices) return
+        steps[stepIndex] = steps[stepIndex].copy(done = !steps[stepIndex].done)
+        val updated = goal.copy(plan = GoalPlanCodec.encode(steps))
+        replaceGoalInState(topic, updated)
+        serviceScope.launch(Dispatchers.IO) { chatDatabase.goalDao().update(updated) }
+    }
+
+    private fun setGoalStatus(topic: String, goal: GoalEntity, status: String) {
+        val updated = goal.copy(status = status)
+        replaceGoalInState(topic, updated)
+        serviceScope.launch(Dispatchers.IO) { chatDatabase.goalDao().update(updated) }
+    }
+
+    private fun deleteGoal(topic: String, goal: GoalEntity) {
+        topicState(topic).goals.removeAll { it.id == goal.id }
+        if (topic == currentTopic) rebuildGoalsRow()
+        serviceScope.launch(Dispatchers.IO) { chatDatabase.goalDao().delete(goal.id) }
+    }
+
+    private fun showGoalDetailOverlay(topic: String, goal: GoalEntity) {
+        removeGoalOverlay()
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.argb(235, PANEL_BG_R, PANEL_BG_G, PANEL_BG_B))
+            }
+        }
+
+        val title = TextView(this).apply {
+            text = goal.title
+            setTextColor(Color.WHITE)
+            textSize = 14f
+        }
+        card.addView(title)
+
+        val steps = GoalPlanCodec.decode(goal.plan)
+        if (steps.isEmpty()) {
+            card.addView(
+                TextView(this).apply {
+                    text = "Planning…"
+                    setTextColor(Color.rgb(200, 200, 205))
+                    textSize = 12f
+                }
+            )
+        } else {
+            steps.forEachIndexed { index, step ->
+                card.addView(
+                    CheckBox(this).apply {
+                        text = step.text
+                        isChecked = step.done
+                        setTextColor(Color.WHITE)
+                        setOnCheckedChangeListener { _, _ -> toggleGoalStep(topic, goal, index) }
+                    }
+                )
+            }
+        }
+
+        val statusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+        }
+
+        val pauseResumeButton = Button(this).apply {
+            text = if (goal.status == GoalStatus.PAUSED) "Resume" else "Pause"
+            setOnClickListener {
+                val newStatus = if (goal.status == GoalStatus.PAUSED) GoalStatus.ACTIVE else GoalStatus.PAUSED
+                setGoalStatus(topic, goal, newStatus)
+                removeGoalOverlay()
+            }
+        }
+
+        val doneButton = Button(this).apply {
+            text = "Mark done"
+            setOnClickListener {
+                setGoalStatus(topic, goal, GoalStatus.DONE)
+                removeGoalOverlay()
+            }
+        }
+
+        val deleteButton = Button(this).apply {
+            text = "Delete"
+            setOnClickListener {
+                deleteGoal(topic, goal)
+                removeGoalOverlay()
+            }
+        }
+
+        statusRow.addView(pauseResumeButton)
+        statusRow.addView(doneButton)
+        statusRow.addView(deleteButton)
+        card.addView(statusRow)
+
+        val closeButton = Button(this).apply {
+            text = "Close"
+            setOnClickListener { removeGoalOverlay() }
+        }
+        card.addView(closeButton)
+
+        goalOverlayView = card
+        windowManager.addView(card, createScanChoiceParams())
+    }
+
+    // endregion
+
+    // region Daily priority
+
+    private fun loadDailyPriority() {
+        serviceScope.launch {
+            val entity = withContext(Dispatchers.IO) { chatDatabase.dailyPriorityDao().get() }
+            dailyPriorityText = entity?.text
+            updateDailyPriorityUi()
+        }
+    }
+
+    private fun updateDailyPriorityUi() {
+        val showSection = currentTopic == "General"
+        dailyPriorityContainer?.visibility = if (showSection) View.VISIBLE else View.GONE
+        if (!showSection) return
+
+        val text = dailyPriorityText
+        if (isDailyPriorityLoading) {
+            dailyPriorityBodyView?.text = "Thinking…"
+            dailyPriorityBodyView?.visibility = View.VISIBLE
+        } else if (!text.isNullOrBlank()) {
+            dailyPriorityBodyView?.text = text
+            dailyPriorityBodyView?.visibility = View.VISIBLE
+        } else {
+            dailyPriorityBodyView?.visibility = View.GONE
+        }
+    }
+
+    private fun onDailyPriorityButtonClicked() {
+        if (isDailyPriorityLoading) return
+        isDailyPriorityLoading = true
+        updateDailyPriorityUi()
+
+        serviceScope.launch {
+            val apiKey = securePrefs.getApiKey()
+            if (apiKey.isNullOrBlank()) {
+                isDailyPriorityLoading = false
+                dailyPriorityText = "No API key set. Open Settings to add one."
+                updateDailyPriorityUi()
+                return@launch
+            }
+
+            val accountState = AccountStateBuilder.build(chatDatabase, topic = null)
+            val systemPrompt = "$accountState\n\n$DAILY_PRIORITY_SYSTEM_SUFFIX"
+            val userMessage = ApiMessage(role = "user", blocks = listOf(ApiContentBlock(type = "text", text = DAILY_PRIORITY_USER_MESSAGE)))
+
+            val result = AnthropicClient.sendMessage(
+                apiKey, systemPrompt, listOf(userMessage), webSearchEnabled = false, maxTokens = DAILY_PRIORITY_MAX_TOKENS
+            )
+
+            isDailyPriorityLoading = false
+            result.onSuccess { reply ->
+                val text = reply.text.trim()
+                dailyPriorityText = text
+                updateDailyPriorityUi()
+                withContext(Dispatchers.IO) {
+                    chatDatabase.dailyPriorityDao().upsert(DailyPriorityEntity(0, text, System.currentTimeMillis()))
+                }
+            }.onFailure { error ->
+                dailyPriorityText = error.message ?: "Something went wrong."
+                updateDailyPriorityUi()
+            }
         }
     }
 
@@ -1077,6 +1449,43 @@ class OverlayService : Service() {
         header.addView(settingsButton)
         header.addView(collapseButton)
 
+        val dailyPriorityButton = Button(this).apply {
+            text = "What should I do today?"
+            setOnClickListener { onDailyPriorityButtonClicked() }
+        }
+
+        val dailyPriorityBody = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            visibility = View.GONE
+        }
+        dailyPriorityBodyView = dailyPriorityBody
+
+        val dailyPriorityCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                cornerRadius = dp(8).toFloat()
+                setColor(Color.argb(90, 33, 150, 243))
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
+            addView(dailyPriorityBody)
+        }
+
+        val dailyPrioritySection = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
+            addView(dailyPriorityButton)
+            addView(dailyPriorityCard)
+        }
+        dailyPriorityContainer = dailyPrioritySection
+
         val pinnedSummaryHeader = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 12f
@@ -1277,6 +1686,8 @@ class OverlayService : Service() {
 
         content.addView(header)
         content.addView(createTabBarView())
+        content.addView(dailyPrioritySection)
+        content.addView(createGoalsRowView())
         content.addView(pinnedSummaryCard)
         content.addView(opacityRow)
         content.addView(controlsRow)
@@ -1285,6 +1696,7 @@ class OverlayService : Service() {
         content.addView(inputRow)
 
         updatePinnedSummaryUi()
+        updateDailyPriorityUi()
 
         val resizeHandle = View(this).apply {
             background = GradientDrawable().apply {
@@ -1745,8 +2157,8 @@ class OverlayService : Service() {
         showTypingIndicator(topic)
 
         val webSearchEnabled = securePrefs.getWebSearchEnabled()
-        val cachedContext = if (webSearchEnabled) buildCachedChampionContext(topic) else null
-        val systemPrompt = buildSystemPrompt(securePrefs.getBriefing().orEmpty(), webSearchEnabled, cachedContext, topic)
+        val accountState = AccountStateBuilder.build(chatDatabase, topic)
+        val systemPrompt = buildSystemPrompt(securePrefs.getBriefing().orEmpty(), webSearchEnabled, accountState, topic)
         val state = topicState(topic)
         val result = AnthropicClient.sendMessage(apiKey, systemPrompt, state.history, webSearchEnabled)
 
@@ -1775,37 +2187,14 @@ class OverlayService : Service() {
         }
     }
 
-    private fun buildSystemPrompt(briefing: String, webSearchEnabled: Boolean, cachedContext: String?, topic: String): String {
-        val parts = mutableListOf(SYSTEM_PROMPT_PREFIX, "Current tab/focus: $topic.")
+    private fun buildSystemPrompt(briefing: String, webSearchEnabled: Boolean, accountState: String, topic: String): String {
+        val parts = mutableListOf(accountState, SYSTEM_PROMPT_PREFIX, "Current tab/focus: $topic.")
         if (webSearchEnabled) {
             parts.add(WEB_SEARCH_CLAUSE)
             parts.add(CHAMPION_CACHE_INSTRUCTION)
         }
-        if (!cachedContext.isNullOrBlank()) parts.add(cachedContext)
         if (briefing.isNotBlank()) parts.add(briefing)
         return parts.joinToString("\n\n")
-    }
-
-    // Looks for a cached champion whose name appears in the latest outgoing user text of this
-    // topic and is still fresh (< 30 days old); returns a context note to inject, or null.
-    private suspend fun buildCachedChampionContext(topic: String): String? {
-        val lastUserText = topicState(topic).history.lastOrNull { it.role == "user" }
-            ?.blocks
-            ?.filter { it.type == "text" }
-            ?.joinToString(" ") { it.text.orEmpty() }
-            ?: return null
-        if (lastUserText.isBlank()) return null
-
-        val cached = withContext(Dispatchers.IO) { chatDatabase.championCacheDao().getAll() }
-        val match = cached.firstOrNull { entry -> lastUserText.contains(entry.championName, ignoreCase = true) }
-            ?: return null
-
-        val ageMillis = System.currentTimeMillis() - match.timestamp
-        if (ageMillis > CHAMPION_CACHE_MAX_AGE_MS) return null
-
-        val ageDays = ageMillis / (24 * 60 * 60 * 1000)
-        return "Cached research on ${match.championName} from $ageDays day(s) ago: ${match.summary}\n" +
-            "Prefer this over a new web search unless it seems stale or I explicitly ask for updated/fresh info."
     }
 
     // Strips the model's own [CHAMPION_CACHE: ...] marker (if present) from the display text and
